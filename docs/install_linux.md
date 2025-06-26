@@ -297,6 +297,15 @@ Manjaro Linux users can install from the [official extra repository](https://man
 pamac install github-cli
 ```
 
+### Solus Linux
+Solus Linux users can install using [eopkg package manager](https://help.getsol.us/docs/user/package-management/basics/):
+
+```bash
+sudo eopkg install github-cli
+```
+
+For more information about the `github-cli` package, see [the package definition](https://github.com/getsolus/packages/blob/main/packages/g/github-cli/package.yml) in the `getsolus/packages` repository.
+
 [releases page]: https://github.com/cli/cli/releases/latest
 [arch linux repo]: https://www.archlinux.org/packages/extra/x86_64/github-cli
 [arch linux aur]: https://aur.archlinux.org/packages/github-cli-git
