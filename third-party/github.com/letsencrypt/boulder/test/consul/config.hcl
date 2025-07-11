@@ -1,7 +1,7 @@
 # Keep this file in sync with the ports bound in test/startservers.py
 
 client_addr = "0.0.0.0"
-bind_addr   = "10.55.55.10"
+bind_addr   = "10.77.77.10"
 log_level   = "ERROR"
 // When set, uses a subset of the agent's TLS configuration (key_file,
 // cert_file, ca_file, ca_path, and server_name) to set up the client for HTTP
@@ -30,6 +30,14 @@ services {
   name    = "akamai-purger"
   address = "10.77.77.77"
   port    = 9399
+  tags    = ["tcp"] // Required for SRV RR support in gRPC DNS resolution.
+}
+
+services {
+  id      = "email-exporter-a"
+  name    = "email-exporter"
+  address = "10.77.77.77"
+  port    = 9603
   tags    = ["tcp"] // Required for SRV RR support in gRPC DNS resolution.
 }
 
@@ -145,6 +153,22 @@ services {
 }
 
 services {
+  id      = "ra-sct-provider-a"
+  name    = "ra-sct-provider"
+  address = "10.77.77.77"
+  port    = 9594
+  tags    = ["tcp"] // Required for SRV RR support in gRPC DNS resolution.
+}
+
+services {
+  id      = "ra-sct-provider-b"
+  name    = "ra-sct-provider"
+  address = "10.77.77.77"
+  port    = 9694
+  tags    = ["tcp"] // Required for SRV RR support in gRPC DNS resolution.
+}
+
+services {
   id      = "ra-a"
   name    = "ra"
   address = "10.77.77.77"
@@ -173,6 +197,14 @@ services {
   name    = "rva1"
   address = "10.77.77.77"
   port    = 9498
+  tags    = ["tcp"] // Required for SRV RR support in gRPC DNS resolution.
+}
+
+services {
+  id      = "rva1-c"
+  name    = "rva1"
+  address = "10.77.77.77"
+  port    = 9499
   tags    = ["tcp"] // Required for SRV RR support in gRPC DNS resolution.
 }
 
@@ -286,7 +318,7 @@ services {
 services {
   id      = "bredis3"
   name    = "redisratelimits"
-  address = "10.33.33.4"
+  address = "10.77.77.4"
   port    = 4218
   tags    = ["tcp"] // Required for SRV RR support in DNS resolution.
 }
@@ -294,7 +326,7 @@ services {
 services {
   id      = "bredis4"
   name    = "redisratelimits"
-  address = "10.33.33.5"
+  address = "10.77.77.5"
   port    = 4218
   tags    = ["tcp"] // Required for SRV RR support in DNS resolution.
 }

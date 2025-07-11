@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"slices"
 	"strconv"
@@ -20,135 +21,9 @@ import (
 	"github.com/miekg/dns"
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/letsencrypt/boulder/features"
+	"github.com/letsencrypt/boulder/iana"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/metrics"
-)
-
-func parseCidr(network string, comment string) net.IPNet {
-	_, net, err := net.ParseCIDR(network)
-	if err != nil {
-		panic(fmt.Sprintf("error parsing %s (%s): %s", network, comment, err))
-	}
-	return *net
-}
-
-var (
-	// Private CIDRs to ignore
-	privateNetworks = []net.IPNet{
-		// RFC1918
-		// 10.0.0.0/8
-		{
-			IP:   []byte{10, 0, 0, 0},
-			Mask: []byte{255, 0, 0, 0},
-		},
-		// 172.16.0.0/12
-		{
-			IP:   []byte{172, 16, 0, 0},
-			Mask: []byte{255, 240, 0, 0},
-		},
-		// 192.168.0.0/16
-		{
-			IP:   []byte{192, 168, 0, 0},
-			Mask: []byte{255, 255, 0, 0},
-		},
-		// RFC5735
-		// 127.0.0.0/8
-		{
-			IP:   []byte{127, 0, 0, 0},
-			Mask: []byte{255, 0, 0, 0},
-		},
-		// RFC1122 Section 3.2.1.3
-		// 0.0.0.0/8
-		{
-			IP:   []byte{0, 0, 0, 0},
-			Mask: []byte{255, 0, 0, 0},
-		},
-		// RFC3927
-		// 169.254.0.0/16
-		{
-			IP:   []byte{169, 254, 0, 0},
-			Mask: []byte{255, 255, 0, 0},
-		},
-		// RFC 5736
-		// 192.0.0.0/24
-		{
-			IP:   []byte{192, 0, 0, 0},
-			Mask: []byte{255, 255, 255, 0},
-		},
-		// RFC 5737
-		// 192.0.2.0/24
-		{
-			IP:   []byte{192, 0, 2, 0},
-			Mask: []byte{255, 255, 255, 0},
-		},
-		// 198.51.100.0/24
-		{
-			IP:   []byte{198, 51, 100, 0},
-			Mask: []byte{255, 255, 255, 0},
-		},
-		// 203.0.113.0/24
-		{
-			IP:   []byte{203, 0, 113, 0},
-			Mask: []byte{255, 255, 255, 0},
-		},
-		// RFC 3068
-		// 192.88.99.0/24
-		{
-			IP:   []byte{192, 88, 99, 0},
-			Mask: []byte{255, 255, 255, 0},
-		},
-		// RFC 2544, Errata 423
-		// 198.18.0.0/15
-		{
-			IP:   []byte{198, 18, 0, 0},
-			Mask: []byte{255, 254, 0, 0},
-		},
-		// RFC 3171
-		// 224.0.0.0/4
-		{
-			IP:   []byte{224, 0, 0, 0},
-			Mask: []byte{240, 0, 0, 0},
-		},
-		// RFC 1112
-		// 240.0.0.0/4
-		{
-			IP:   []byte{240, 0, 0, 0},
-			Mask: []byte{240, 0, 0, 0},
-		},
-		// RFC 919 Section 7
-		// 255.255.255.255/32
-		{
-			IP:   []byte{255, 255, 255, 255},
-			Mask: []byte{255, 255, 255, 255},
-		},
-		// RFC 6598
-		// 100.64.0.0/10
-		{
-			IP:   []byte{100, 64, 0, 0},
-			Mask: []byte{255, 192, 0, 0},
-		},
-	}
-	// Sourced from https://www.iana.org/assignments/iana-ipv6-special-registry/iana-ipv6-special-registry.xhtml
-	// where Global, Source, or Destination is False
-	privateV6Networks = []net.IPNet{
-		parseCidr("::/128", "RFC 4291: Unspecified Address"),
-		parseCidr("::1/128", "RFC 4291: Loopback Address"),
-		parseCidr("::ffff:0:0/96", "RFC 4291: IPv4-mapped Address"),
-		parseCidr("100::/64", "RFC 6666: Discard Address Block"),
-		parseCidr("2001::/23", "RFC 2928: IETF Protocol Assignments"),
-		parseCidr("2001:2::/48", "RFC 5180: Benchmarking"),
-		parseCidr("2001:db8::/32", "RFC 3849: Documentation"),
-		parseCidr("2001::/32", "RFC 4380: TEREDO"),
-		parseCidr("fc00::/7", "RFC 4193: Unique-Local"),
-		parseCidr("fe80::/10", "RFC 4291: Section 2.5.6 Link-Scoped Unicast"),
-		parseCidr("ff00::/8", "RFC 4291: Section 2.7"),
-		// We disable validations to IPs under the 6to4 anycase prefix because
-		// there's too much risk of a malicious actor advertising the prefix and
-		// answering validations for a 6to4 host they do not control.
-		// https://community.letsencrypt.org/t/problems-validating-ipv6-against-host-running-6to4/18312/9
-		parseCidr("2002::/16", "RFC 7526: 6to4 anycast prefix deprecated"),
-	}
 )
 
 // ResolverAddrs contains DNS resolver(s) that were chosen to perform a
@@ -160,7 +35,7 @@ type ResolverAddrs []string
 // Client queries for DNS records
 type Client interface {
 	LookupTXT(context.Context, string) (txts []string, resolver ResolverAddrs, err error)
-	LookupHost(context.Context, string) ([]net.IP, ResolverAddrs, error)
+	LookupHost(context.Context, string) ([]netip.Addr, ResolverAddrs, error)
 	LookupCAA(context.Context, string) ([]*dns.CAA, string, ResolverAddrs, error)
 }
 
@@ -196,33 +71,28 @@ func New(
 	stats prometheus.Registerer,
 	clk clock.Clock,
 	maxTries int,
+	userAgent string,
 	log blog.Logger,
 	tlsConfig *tls.Config,
 ) Client {
 	var client exchanger
-	if features.Get().DOH {
-		// Clone the default transport because it comes with various settings
-		// that we like, which are different from the zero value of an
-		// `http.Transport`.
-		transport := http.DefaultTransport.(*http.Transport).Clone()
-		transport.TLSClientConfig = tlsConfig
-		// The default transport already sets this field, but it isn't
-		// documented that it will always be set. Set it again to be sure,
-		// because Unbound will reject non-HTTP/2 DoH requests.
-		transport.ForceAttemptHTTP2 = true
-		client = &dohExchanger{
-			clk: clk,
-			hc: http.Client{
-				Timeout:   readTimeout,
-				Transport: transport,
-			},
-		}
-	} else {
-		client = &dns.Client{
-			// Set timeout for underlying net.Conn
-			ReadTimeout: readTimeout,
-			Net:         "udp",
-		}
+
+	// Clone the default transport because it comes with various settings
+	// that we like, which are different from the zero value of an
+	// `http.Transport`.
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = tlsConfig
+	// The default transport already sets this field, but it isn't
+	// documented that it will always be set. Set it again to be sure,
+	// because Unbound will reject non-HTTP/2 DoH requests.
+	transport.ForceAttemptHTTP2 = true
+	client = &dohExchanger{
+		clk: clk,
+		hc: http.Client{
+			Timeout:   readTimeout,
+			Transport: transport,
+		},
+		userAgent: userAgent,
 	}
 
 	queryTime := prometheus.NewHistogramVec(
@@ -279,10 +149,11 @@ func NewTest(
 	stats prometheus.Registerer,
 	clk clock.Clock,
 	maxTries int,
+	userAgent string,
 	log blog.Logger,
 	tlsConfig *tls.Config,
 ) Client {
-	resolver := New(readTimeout, servers, stats, clk, maxTries, log, tlsConfig)
+	resolver := New(readTimeout, servers, stats, clk, maxTries, userAgent, log, tlsConfig)
 	resolver.(*impl).allowRestrictedAddresses = true
 	return resolver
 }
@@ -402,17 +273,10 @@ func (dnsClient *impl) exchangeOne(ctx context.Context, hostname string, qtype u
 		case r := <-ch:
 			if r.err != nil {
 				var isRetryable bool
-				if features.Get().DOH {
-					// According to the http package documentation, retryable
-					// errors emitted by the http package are of type *url.Error.
-					var urlErr *url.Error
-					isRetryable = errors.As(r.err, &urlErr) && urlErr.Temporary()
-				} else {
-					// According to the net package documentation, retryable
-					// errors emitted by the net package are of type *net.OpError.
-					var opErr *net.OpError
-					isRetryable = errors.As(r.err, &opErr) && opErr.Temporary()
-				}
+				// According to the http package documentation, retryable
+				// errors emitted by the http package are of type *url.Error.
+				var urlErr *url.Error
+				isRetryable = errors.As(r.err, &urlErr) && urlErr.Temporary()
 				hasRetriesLeft := tries < dnsClient.maxTries
 				if isRetryable && hasRetriesLeft {
 					tries++
@@ -437,7 +301,6 @@ func (dnsClient *impl) exchangeOne(ctx context.Context, hostname string, qtype u
 			return
 		}
 	}
-
 }
 
 // isTLD returns a simplified view of whether something is a TLD: does it have
@@ -479,24 +342,6 @@ func (dnsClient *impl) LookupTXT(ctx context.Context, hostname string) ([]string
 	return txt, ResolverAddrs{resolver}, err
 }
 
-func isPrivateV4(ip net.IP) bool {
-	for _, net := range privateNetworks {
-		if net.Contains(ip) {
-			return true
-		}
-	}
-	return false
-}
-
-func isPrivateV6(ip net.IP) bool {
-	for _, net := range privateV6Networks {
-		if net.Contains(ip) {
-			return true
-		}
-	}
-	return false
-}
-
 func (dnsClient *impl) lookupIP(ctx context.Context, hostname string, ipType uint16) ([]dns.RR, string, error) {
 	resp, resolver, err := dnsClient.exchangeOne(ctx, hostname, ipType)
 	switch ipType {
@@ -521,7 +366,7 @@ func (dnsClient *impl) lookupIP(ctx context.Context, hostname string, ipType uin
 // chase CNAME/DNAME aliases and return relevant records. It will retry
 // requests in the case of temporary network errors. It returns an error if
 // both the A and AAAA lookups fail or are empty, but succeeds otherwise.
-func (dnsClient *impl) LookupHost(ctx context.Context, hostname string) ([]net.IP, ResolverAddrs, error) {
+func (dnsClient *impl) LookupHost(ctx context.Context, hostname string) ([]netip.Addr, ResolverAddrs, error) {
 	var recordsA, recordsAAAA []dns.RR
 	var errA, errAAAA error
 	var resolverA, resolverAAAA string
@@ -544,13 +389,16 @@ func (dnsClient *impl) LookupHost(ctx context.Context, hostname string) ([]net.I
 		return a == ""
 	})
 
-	var addrsA []net.IP
+	var addrsA []netip.Addr
 	if errA == nil {
 		for _, answer := range recordsA {
 			if answer.Header().Rrtype == dns.TypeA {
 				a, ok := answer.(*dns.A)
-				if ok && a.A.To4() != nil && (!isPrivateV4(a.A) || dnsClient.allowRestrictedAddresses) {
-					addrsA = append(addrsA, a.A)
+				if ok && a.A.To4() != nil {
+					netIP, ok := netip.AddrFromSlice(a.A)
+					if ok && (iana.IsReservedAddr(netIP) == nil || dnsClient.allowRestrictedAddresses) {
+						addrsA = append(addrsA, netIP)
+					}
 				}
 			}
 		}
@@ -559,13 +407,16 @@ func (dnsClient *impl) LookupHost(ctx context.Context, hostname string) ([]net.I
 		}
 	}
 
-	var addrsAAAA []net.IP
+	var addrsAAAA []netip.Addr
 	if errAAAA == nil {
 		for _, answer := range recordsAAAA {
 			if answer.Header().Rrtype == dns.TypeAAAA {
 				aaaa, ok := answer.(*dns.AAAA)
-				if ok && aaaa.AAAA.To16() != nil && (!isPrivateV6(aaaa.AAAA) || dnsClient.allowRestrictedAddresses) {
-					addrsAAAA = append(addrsAAAA, aaaa.AAAA)
+				if ok && aaaa.AAAA.To16() != nil {
+					netIP, ok := netip.AddrFromSlice(aaaa.AAAA)
+					if ok && (iana.IsReservedAddr(netIP) == nil || dnsClient.allowRestrictedAddresses) {
+						addrsAAAA = append(addrsAAAA, netIP)
+					}
 				}
 			}
 		}
@@ -685,8 +536,9 @@ func logDNSError(
 }
 
 type dohExchanger struct {
-	clk clock.Clock
-	hc  http.Client
+	clk       clock.Clock
+	hc        http.Client
+	userAgent string
 }
 
 // Exchange sends a DoH query to the provided DoH server and returns the response.
@@ -704,6 +556,9 @@ func (d *dohExchanger) Exchange(query *dns.Msg, server string) (*dns.Msg, time.D
 	}
 	req.Header.Set("Content-Type", "application/dns-message")
 	req.Header.Set("Accept", "application/dns-message")
+	if len(d.userAgent) > 0 {
+		req.Header.Set("User-Agent", d.userAgent)
+	}
 
 	start := d.clk.Now()
 	resp, err := d.hc.Do(req)

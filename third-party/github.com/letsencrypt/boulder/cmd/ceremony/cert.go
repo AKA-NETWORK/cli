@@ -17,9 +17,6 @@ import (
 
 type policyInfoConfig struct {
 	OID string
-	// Deprecated: we do not include the id-qt-cps policy qualifier in our
-	// certificate policy extensions anymore.
-	CPSURI string `yaml:"cps-uri"`
 }
 
 // certProfile contains the information required to generate a certificate
@@ -308,12 +305,11 @@ func makeTemplate(randReader io.Reader, profile *certProfile, pubKey []byte, tbc
 	case crlCert:
 		cert.IsCA = false
 	case requestCert, intermediateCert:
-		// id-kp-serverAuth and id-kp-clientAuth are included in intermediate
-		// certificates in order to technically constrain them. id-kp-serverAuth
-		// is required by 7.1.2.2.g of the CABF Baseline Requirements, but
-		// id-kp-clientAuth isn't. We include id-kp-clientAuth as we also include
-		// it in our end-entity certificates.
-		cert.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth}
+		// id-kp-serverAuth is included in intermediate certificates, as required by
+		// Section 7.1.2.10.6 of the CA/BF Baseline Requirements.
+		// id-kp-clientAuth is excluded, as required by section 3.2.1 of the Chrome
+		// Root Program Requirements.
+		cert.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
 		cert.MaxPathLenZero = true
 	case crossCert:
 		cert.ExtKeyUsage = tbcs.ExtKeyUsage
@@ -321,11 +317,11 @@ func makeTemplate(randReader io.Reader, profile *certProfile, pubKey []byte, tbc
 	}
 
 	for _, policyConfig := range profile.Policies {
-		oid, err := parseOID(policyConfig.OID)
+		x509OID, err := x509.ParseOID(policyConfig.OID)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to parse %s as OID: %w", policyConfig.OID, err)
 		}
-		cert.PolicyIdentifiers = append(cert.PolicyIdentifiers, oid)
+		cert.Policies = append(cert.Policies, x509OID)
 	}
 
 	return cert, nil

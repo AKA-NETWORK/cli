@@ -7,7 +7,7 @@ package grpc
 
 import (
 	"fmt"
-	"net"
+	"net/netip"
 	"time"
 
 	"github.com/go-jose/go-jose/v4"
@@ -18,12 +18,12 @@ import (
 	corepb "github.com/letsencrypt/boulder/core/proto"
 	"github.com/letsencrypt/boulder/identifier"
 	"github.com/letsencrypt/boulder/probs"
-	"github.com/letsencrypt/boulder/revocation"
 	sapb "github.com/letsencrypt/boulder/sa/proto"
 	vapb "github.com/letsencrypt/boulder/va/proto"
 )
 
 var ErrMissingParameters = CodedError(codes.FailedPrecondition, "required RPC parameter was missing")
+var ErrInvalidParameters = CodedError(codes.InvalidArgument, "RPC parameter was invalid")
 
 // This file defines functions to translate between the protobuf types and the
 // code types.
@@ -36,7 +36,7 @@ func ProblemDetailsToPB(prob *probs.ProblemDetails) (*corepb.ProblemDetails, err
 	return &corepb.ProblemDetails{
 		ProblemType: string(prob.Type),
 		Detail:      prob.Detail,
-		HttpStatus:  int32(prob.HTTPStatus),
+		HttpStatus:  int32(prob.HTTPStatus), //nolint: gosec // HTTP status codes are guaranteed to be small, no risk of overflow.
 	}, nil
 }
 
@@ -83,7 +83,6 @@ func ChallengeToPB(challenge core.Challenge) (*corepb.Challenge, error) {
 		Type:              string(challenge.Type),
 		Status:            string(challenge.Status),
 		Token:             challenge.Token,
-		KeyAuthorization:  challenge.ProvidedKeyAuthorization,
 		Error:             prob,
 		Validationrecords: recordAry,
 		Validated:         validated,
@@ -124,9 +123,6 @@ func PBToChallenge(in *corepb.Challenge) (challenge core.Challenge, err error) {
 		ValidationRecord: recordAry,
 		Validated:        validated,
 	}
-	if in.KeyAuthorization != "" {
-		ch.ProvidedKeyAuthorization = in.KeyAuthorization
-	}
 	return ch, nil
 }
 
@@ -135,10 +131,10 @@ func ValidationRecordToPB(record core.ValidationRecord) (*corepb.ValidationRecor
 	addrsTried := make([][]byte, len(record.AddressesTried))
 	var err error
 	for i, v := range record.AddressesResolved {
-		addrs[i] = []byte(v)
+		addrs[i] = v.AsSlice()
 	}
 	for i, v := range record.AddressesTried {
-		addrsTried[i] = []byte(v)
+		addrsTried[i] = v.AsSlice()
 	}
 	addrUsed, err := record.AddressUsed.MarshalText()
 	if err != nil {
@@ -159,15 +155,23 @@ func PBToValidationRecord(in *corepb.ValidationRecord) (record core.ValidationRe
 	if in == nil {
 		return core.ValidationRecord{}, ErrMissingParameters
 	}
-	addrs := make([]net.IP, len(in.AddressesResolved))
+	addrs := make([]netip.Addr, len(in.AddressesResolved))
 	for i, v := range in.AddressesResolved {
-		addrs[i] = net.IP(v)
+		netIP, ok := netip.AddrFromSlice(v)
+		if !ok {
+			return core.ValidationRecord{}, ErrInvalidParameters
+		}
+		addrs[i] = netIP
 	}
-	addrsTried := make([]net.IP, len(in.AddressesTried))
+	addrsTried := make([]netip.Addr, len(in.AddressesTried))
 	for i, v := range in.AddressesTried {
-		addrsTried[i] = net.IP(v)
+		netIP, ok := netip.AddrFromSlice(v)
+		if !ok {
+			return core.ValidationRecord{}, ErrInvalidParameters
+		}
+		addrsTried[i] = netIP
 	}
-	var addrUsed net.IP
+	var addrUsed netip.Addr
 	err = addrUsed.UnmarshalText(in.AddressUsed)
 	if err != nil {
 		return
@@ -183,7 +187,7 @@ func PBToValidationRecord(in *corepb.ValidationRecord) (record core.ValidationRe
 	}, nil
 }
 
-func ValidationResultToPB(records []core.ValidationRecord, prob *probs.ProblemDetails) (*vapb.ValidationResult, error) {
+func ValidationResultToPB(records []core.ValidationRecord, prob *probs.ProblemDetails, perspective, rir string) (*vapb.ValidationResult, error) {
 	recordAry := make([]*corepb.ValidationRecord, len(records))
 	var err error
 	for i, v := range records {
@@ -192,13 +196,15 @@ func ValidationResultToPB(records []core.ValidationRecord, prob *probs.ProblemDe
 			return nil, err
 		}
 	}
-	marshalledProbs, err := ProblemDetailsToPB(prob)
+	marshalledProb, err := ProblemDetailsToPB(prob)
 	if err != nil {
 		return nil, err
 	}
 	return &vapb.ValidationResult{
-		Records:  recordAry,
-		Problems: marshalledProbs,
+		Records:     recordAry,
+		Problem:     marshalledProb,
+		Perspective: perspective,
+		Rir:         rir,
 	}, nil
 }
 
@@ -214,7 +220,7 @@ func pbToValidationResult(in *vapb.ValidationResult) ([]core.ValidationRecord, *
 			return nil, nil, err
 		}
 	}
-	prob, err := PBToProblemDetails(in.Problems)
+	prob, err := PBToProblemDetails(in.Problem)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -226,15 +232,7 @@ func RegistrationToPB(reg core.Registration) (*corepb.Registration, error) {
 	if err != nil {
 		return nil, err
 	}
-	ipBytes, err := reg.InitialIP.MarshalText()
-	if err != nil {
-		return nil, err
-	}
 	var contacts []string
-	// Since the default value of corepb.Registration.Contact is a slice
-	// we need a indicator as to if the value is actually important on
-	// the other side (pb -> reg).
-	contactsPresent := reg.Contact != nil
 	if reg.Contact != nil {
 		contacts = *reg.Contact
 	}
@@ -247,14 +245,12 @@ func RegistrationToPB(reg core.Registration) (*corepb.Registration, error) {
 	}
 
 	return &corepb.Registration{
-		Id:              reg.ID,
-		Key:             keyBytes,
-		Contact:         contacts,
-		ContactsPresent: contactsPresent,
-		Agreement:       reg.Agreement,
-		InitialIP:       ipBytes,
-		CreatedAt:       createdAt,
-		Status:          string(reg.Status),
+		Id:        reg.ID,
+		Key:       keyBytes,
+		Contact:   contacts,
+		Agreement: reg.Agreement,
+		CreatedAt: createdAt,
+		Status:    string(reg.Status),
 	}, nil
 }
 
@@ -264,36 +260,20 @@ func PbToRegistration(pb *corepb.Registration) (core.Registration, error) {
 	if err != nil {
 		return core.Registration{}, err
 	}
-	var initialIP net.IP
-	err = initialIP.UnmarshalText(pb.InitialIP)
-	if err != nil {
-		return core.Registration{}, err
-	}
 	var createdAt *time.Time
 	if !core.IsAnyNilOrZero(pb.CreatedAt) {
 		c := pb.CreatedAt.AsTime()
 		createdAt = &c
 	}
 	var contacts *[]string
-	if pb.ContactsPresent {
-		if len(pb.Contact) != 0 {
-			contacts = &pb.Contact
-		} else {
-			// When gRPC creates an empty slice it is actually a nil slice. Since
-			// certain things boulder uses, like encoding/json, differentiate between
-			// these we need to de-nil these slices. Without this we are unable to
-			// properly do registration updates as contacts would always be removed
-			// as we use the difference between a nil and empty slice in ra.mergeUpdate.
-			empty := []string{}
-			contacts = &empty
-		}
+	if len(pb.Contact) != 0 {
+		contacts = &pb.Contact
 	}
 	return core.Registration{
 		ID:        pb.Id,
 		Key:       &key,
 		Contact:   contacts,
 		Agreement: pb.Agreement,
-		InitialIP: initialIP,
 		CreatedAt: createdAt,
 		Status:    core.AcmeStatus(pb.Status),
 	}, nil
@@ -317,12 +297,13 @@ func AuthzToPB(authz core.Authorization) (*corepb.Authorization, error) {
 	}
 
 	return &corepb.Authorization{
-		Id:             authz.ID,
-		Identifier:     authz.Identifier.Value,
-		RegistrationID: authz.RegistrationID,
-		Status:         string(authz.Status),
-		Expires:        expires,
-		Challenges:     challs,
+		Id:                     authz.ID,
+		Identifier:             authz.Identifier.ToProto(),
+		RegistrationID:         authz.RegistrationID,
+		Status:                 string(authz.Status),
+		Expires:                expires,
+		Challenges:             challs,
+		CertificateProfileName: authz.CertificateProfileName,
 	}, nil
 }
 
@@ -341,12 +322,13 @@ func PBToAuthz(pb *corepb.Authorization) (core.Authorization, error) {
 		expires = &c
 	}
 	authz := core.Authorization{
-		ID:             pb.Id,
-		Identifier:     identifier.ACMEIdentifier{Type: identifier.DNS, Value: pb.Identifier},
-		RegistrationID: pb.RegistrationID,
-		Status:         core.AcmeStatus(pb.Status),
-		Expires:        expires,
-		Challenges:     challs,
+		ID:                     pb.Id,
+		Identifier:             identifier.FromProto(pb.Identifier),
+		RegistrationID:         pb.RegistrationID,
+		Status:                 core.AcmeStatus(pb.Status),
+		Expires:                expires,
+		Challenges:             challs,
+		CertificateProfileName: pb.CertificateProfileName,
 	}
 	return authz, nil
 }
@@ -366,69 +348,19 @@ func orderValid(order *corepb.Order) bool {
 // `order.CertificateSerial` to be nil such that it can be used in places where
 // the order has not been finalized yet.
 func newOrderValid(order *corepb.Order) bool {
-	return !(order.RegistrationID == 0 || order.Expires == nil || len(order.Names) == 0)
+	return !(order.RegistrationID == 0 || order.Expires == nil || len(order.Identifiers) == 0)
 }
 
-func CertToPB(cert core.Certificate) *corepb.Certificate {
-	return &corepb.Certificate{
-		RegistrationID: cert.RegistrationID,
-		Serial:         cert.Serial,
-		Digest:         cert.Digest,
-		Der:            cert.DER,
-		Issued:         timestamppb.New(cert.Issued),
-		Expires:        timestamppb.New(cert.Expires),
-	}
-}
-
-func PBToCert(pb *corepb.Certificate) core.Certificate {
-	return core.Certificate{
-		RegistrationID: pb.RegistrationID,
-		Serial:         pb.Serial,
-		Digest:         pb.Digest,
-		DER:            pb.Der,
-		Issued:         pb.Issued.AsTime(),
-		Expires:        pb.Expires.AsTime(),
-	}
-}
-
-func CertStatusToPB(certStatus core.CertificateStatus) *corepb.CertificateStatus {
-	return &corepb.CertificateStatus{
-		Serial:                certStatus.Serial,
-		Status:                string(certStatus.Status),
-		OcspLastUpdated:       timestamppb.New(certStatus.OCSPLastUpdated),
-		RevokedDate:           timestamppb.New(certStatus.RevokedDate),
-		RevokedReason:         int64(certStatus.RevokedReason),
-		LastExpirationNagSent: timestamppb.New(certStatus.LastExpirationNagSent),
-		NotAfter:              timestamppb.New(certStatus.NotAfter),
-		IsExpired:             certStatus.IsExpired,
-		IssuerID:              certStatus.IssuerNameID,
-	}
-}
-
-func PBToCertStatus(pb *corepb.CertificateStatus) core.CertificateStatus {
-	return core.CertificateStatus{
-		Serial:                pb.Serial,
-		Status:                core.OCSPStatus(pb.Status),
-		OCSPLastUpdated:       pb.OcspLastUpdated.AsTime(),
-		RevokedDate:           pb.RevokedDate.AsTime(),
-		RevokedReason:         revocation.Reason(pb.RevokedReason),
-		LastExpirationNagSent: pb.LastExpirationNagSent.AsTime(),
-		NotAfter:              pb.NotAfter.AsTime(),
-		IsExpired:             pb.IsExpired,
-		IssuerNameID:          pb.IssuerID,
-	}
-}
-
-// PBToAuthzMap converts a protobuf map of domains mapped to protobuf authorizations to a
-// golang map[string]*core.Authorization.
-func PBToAuthzMap(pb *sapb.Authorizations) (map[string]*core.Authorization, error) {
-	m := make(map[string]*core.Authorization, len(pb.Authz))
-	for _, v := range pb.Authz {
-		authz, err := PBToAuthz(v.Authz)
+// PBToAuthzMap converts a protobuf map of identifiers mapped to protobuf
+// authorizations to a golang map[string]*core.Authorization.
+func PBToAuthzMap(pb *sapb.Authorizations) (map[identifier.ACMEIdentifier]*core.Authorization, error) {
+	m := make(map[identifier.ACMEIdentifier]*core.Authorization, len(pb.Authzs))
+	for _, v := range pb.Authzs {
+		authz, err := PBToAuthz(v)
 		if err != nil {
 			return nil, err
 		}
-		m[v.Domain] = &authz
+		m[authz.Identifier] = &authz
 	}
 	return m, nil
 }

@@ -5,9 +5,7 @@ import (
 	"context"
 	"crypto/x509"
 	"errors"
-	"fmt"
-	"math/rand"
-	"net"
+	"math/rand/v2"
 	"os"
 	"time"
 
@@ -76,12 +74,11 @@ func (sa *StorageAuthorityReadOnly) GetRegistration(_ context.Context, req *sapb
 	}
 
 	goodReg := &corepb.Registration{
-		Id:              req.Id,
-		Key:             []byte(test1KeyPublicJSON),
-		Agreement:       agreementURL,
-		Contact:         []string{"mailto:person@mail.com"},
-		ContactsPresent: true,
-		Status:          string(core.StatusValid),
+		Id:        req.Id,
+		Key:       []byte(test1KeyPublicJSON),
+		Agreement: agreementURL,
+		Contact:   []string{"mailto:person@mail.com"},
+		Status:    string(core.StatusValid),
 	}
 
 	// Return a populated registration with contacts for ID == 1 or ID == 5
@@ -114,7 +111,6 @@ func (sa *StorageAuthorityReadOnly) GetRegistration(_ context.Context, req *sapb
 		return goodReg, nil
 	}
 
-	goodReg.InitialIP, _ = net.ParseIP("5.6.7.8").MarshalText()
 	goodReg.CreatedAt = timestamppb.New(time.Date(2003, 9, 27, 0, 0, 0, 0, time.UTC))
 	return goodReg, nil
 }
@@ -139,12 +135,11 @@ func (sa *StorageAuthorityReadOnly) GetRegistrationByKey(_ context.Context, req 
 
 	if bytes.Equal(req.Jwk, []byte(test1KeyPublicJSON)) {
 		return &corepb.Registration{
-			Id:              1,
-			Key:             req.Jwk,
-			Agreement:       agreementURL,
-			Contact:         contacts,
-			ContactsPresent: true,
-			Status:          string(core.StatusValid),
+			Id:        1,
+			Key:       req.Jwk,
+			Agreement: agreementURL,
+			Contact:   contacts,
+			Status:    string(core.StatusValid),
 		}, nil
 	}
 
@@ -174,12 +169,11 @@ func (sa *StorageAuthorityReadOnly) GetRegistrationByKey(_ context.Context, req 
 	if bytes.Equal(req.Jwk, []byte(test3KeyPublicJSON)) {
 		// deactivated registration
 		return &corepb.Registration{
-			Id:              2,
-			Key:             req.Jwk,
-			Agreement:       agreementURL,
-			Contact:         contacts,
-			ContactsPresent: true,
-			Status:          string(core.StatusDeactivated),
+			Id:        2,
+			Key:       req.Jwk,
+			Agreement: agreementURL,
+			Contact:   contacts,
+			Status:    string(core.StatusDeactivated),
 		}, nil
 	}
 
@@ -226,7 +220,6 @@ func (sa *StorageAuthorityReadOnly) GetCertificateStatus(_ context.Context, req 
 
 func (sa *StorageAuthorityReadOnly) SetCertificateStatusReady(ctx context.Context, req *sapb.Serial, _ ...grpc.CallOption) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "unimplemented mock")
-
 }
 
 // GetRevocationStatus is a mock
@@ -274,8 +267,38 @@ func (sa *StorageAuthority) GetRevokedCerts(ctx context.Context, _ *sapb.GetRevo
 	return &ServerStreamClient[corepb.CRLEntry]{}, nil
 }
 
+// GetRevokedCertsByShard is a mock
+func (sa *StorageAuthorityReadOnly) GetRevokedCertsByShard(ctx context.Context, _ *sapb.GetRevokedCertsByShardRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[corepb.CRLEntry], error) {
+	return &ServerStreamClient[corepb.CRLEntry]{}, nil
+}
+
 // GetMaxExpiration is a mock
 func (sa *StorageAuthorityReadOnly) GetMaxExpiration(_ context.Context, req *emptypb.Empty, _ ...grpc.CallOption) (*timestamppb.Timestamp, error) {
+	return nil, nil
+}
+
+// AddRateLimitOverride is a mock
+func (sa *StorageAuthority) AddRateLimitOverride(_ context.Context, req *sapb.AddRateLimitOverrideRequest, _ ...grpc.CallOption) (*sapb.AddRateLimitOverrideResponse, error) {
+	return nil, nil
+}
+
+// DisableRateLimitOverride is a mock
+func (sa *StorageAuthority) DisableRateLimitOverride(ctx context.Context, req *sapb.DisableRateLimitOverrideRequest) (*emptypb.Empty, error) {
+	return nil, nil
+}
+
+// EnableRateLimitOverride is a mock
+func (sa *StorageAuthority) EnableRateLimitOverride(ctx context.Context, req *sapb.EnableRateLimitOverrideRequest) (*emptypb.Empty, error) {
+	return nil, nil
+}
+
+// GetRateLimitOverride is a mock
+func (sa *StorageAuthorityReadOnly) GetRateLimitOverride(_ context.Context, req *sapb.GetRateLimitOverrideRequest, _ ...grpc.CallOption) (*sapb.RateLimitOverrideResponse, error) {
+	return nil, nil
+}
+
+// GetEnabledRateLimitOverrides is a mock
+func (sa *StorageAuthorityReadOnly) GetEnabledRateLimitOverrides(_ context.Context, _ *emptypb.Empty, _ ...grpc.CallOption) (sapb.StorageAuthorityReadOnly_GetEnabledRateLimitOverridesClient, error) {
 	return nil, nil
 }
 
@@ -304,11 +327,6 @@ func (sa *StorageAuthority) UpdateRegistration(_ context.Context, _ *corepb.Regi
 	return &emptypb.Empty{}, nil
 }
 
-// CountFQDNSets is a mock
-func (sa *StorageAuthorityReadOnly) CountFQDNSets(_ context.Context, _ *sapb.CountFQDNSetsRequest, _ ...grpc.CallOption) (*sapb.Count, error) {
-	return &sapb.Count{}, nil
-}
-
 // FQDNSetTimestampsForWindow is a mock
 func (sa *StorageAuthorityReadOnly) FQDNSetTimestampsForWindow(_ context.Context, _ *sapb.CountFQDNSetsRequest, _ ...grpc.CallOption) (*sapb.Timestamps, error) {
 	return &sapb.Timestamps{}, nil
@@ -317,26 +335,6 @@ func (sa *StorageAuthorityReadOnly) FQDNSetTimestampsForWindow(_ context.Context
 // FQDNSetExists is a mock
 func (sa *StorageAuthorityReadOnly) FQDNSetExists(_ context.Context, _ *sapb.FQDNSetExistsRequest, _ ...grpc.CallOption) (*sapb.Exists, error) {
 	return &sapb.Exists{Exists: false}, nil
-}
-
-// CountCertificatesByNames is a mock
-func (sa *StorageAuthorityReadOnly) CountCertificatesByNames(_ context.Context, _ *sapb.CountCertificatesByNamesRequest, _ ...grpc.CallOption) (*sapb.CountByNames, error) {
-	return &sapb.CountByNames{}, nil
-}
-
-// CountRegistrationsByIP is a mock
-func (sa *StorageAuthorityReadOnly) CountRegistrationsByIP(_ context.Context, _ *sapb.CountRegistrationsByIPRequest, _ ...grpc.CallOption) (*sapb.Count, error) {
-	return &sapb.Count{}, nil
-}
-
-// CountRegistrationsByIPRange is a mock
-func (sa *StorageAuthorityReadOnly) CountRegistrationsByIPRange(_ context.Context, _ *sapb.CountRegistrationsByIPRequest, _ ...grpc.CallOption) (*sapb.Count, error) {
-	return &sapb.Count{}, nil
-}
-
-// CountOrders is a mock
-func (sa *StorageAuthorityReadOnly) CountOrders(_ context.Context, _ *sapb.CountOrdersRequest, _ ...grpc.CallOption) (*sapb.Count, error) {
-	return &sapb.Count{}, nil
 }
 
 // DeactivateRegistration is a mock
@@ -350,10 +348,10 @@ func (sa *StorageAuthority) NewOrderAndAuthzs(_ context.Context, req *sapb.NewOr
 		// Fields from the input new order request.
 		RegistrationID:   req.NewOrder.RegistrationID,
 		Expires:          req.NewOrder.Expires,
-		Names:            req.NewOrder.Names,
+		Identifiers:      req.NewOrder.Identifiers,
 		V2Authorizations: req.NewOrder.V2Authorizations,
 		// Mock new fields generated by the database transaction.
-		Id:      rand.Int63(),
+		Id:      rand.Int64(),
 		Created: timestamppb.Now(),
 		// A new order is never processing because it can't have been finalized yet.
 		BeganProcessing:        false,
@@ -394,12 +392,12 @@ func (sa *StorageAuthorityReadOnly) GetOrder(_ context.Context, req *sapb.OrderR
 		RegistrationID:         1,
 		Created:                timestamppb.New(created),
 		Expires:                timestamppb.New(exp),
-		Names:                  []string{"example.com"},
+		Identifiers:            []*corepb.Identifier{identifier.NewDNS("example.com").ToProto()},
 		Status:                 string(core.StatusValid),
 		V2Authorizations:       []int64{1},
 		CertificateSerial:      "serial",
 		Error:                  nil,
-		CertificateProfileName: "defaultBoulderCertificateProfile",
+		CertificateProfileName: "default",
 	}
 
 	// Order ID doesn't have a certificate serial yet
@@ -468,34 +466,28 @@ func (sa *StorageAuthorityReadOnly) GetValidAuthorizations2(ctx context.Context,
 	if req.RegistrationID != 1 && req.RegistrationID != 5 && req.RegistrationID != 4 {
 		return &sapb.Authorizations{}, nil
 	}
-	now := req.Now.AsTime()
+	expiryCutoff := req.ValidUntil.AsTime()
 	auths := &sapb.Authorizations{}
-	for _, name := range req.Domains {
-		exp := now.AddDate(100, 0, 0)
+	for _, ident := range req.Identifiers {
+		exp := expiryCutoff.AddDate(100, 0, 0)
 		authzPB, err := bgrpc.AuthzToPB(core.Authorization{
 			Status:         core.StatusValid,
 			RegistrationID: req.RegistrationID,
 			Expires:        &exp,
-			Identifier: identifier.ACMEIdentifier{
-				Type:  identifier.DNS,
-				Value: name,
-			},
+			Identifier:     identifier.FromProto(ident),
 			Challenges: []core.Challenge{
 				{
 					Status:    core.StatusValid,
 					Type:      core.ChallengeTypeDNS01,
 					Token:     "exampleToken",
-					Validated: &now,
+					Validated: &expiryCutoff,
 				},
 			},
 		})
 		if err != nil {
 			return nil, err
 		}
-		auths.Authz = append(auths.Authz, &sapb.Authorizations_MapElement{
-			Domain: name,
-			Authz:  authzPB,
-		})
+		auths.Authzs = append(auths.Authzs, authzPB)
 	}
 	return auths, nil
 }
@@ -504,61 +496,9 @@ func (sa *StorageAuthorityReadOnly) GetAuthorizations2(ctx context.Context, req 
 	return &sapb.Authorizations{}, nil
 }
 
-func (sa *StorageAuthorityReadOnly) GetPendingAuthorization2(ctx context.Context, req *sapb.GetPendingAuthorizationRequest, _ ...grpc.CallOption) (*corepb.Authorization, error) {
-	return nil, nil
-}
-
-var (
-	authzIdValid       = int64(1)
-	authzIdPending     = int64(2)
-	authzIdExpired     = int64(3)
-	authzIdErrorResult = int64(4)
-	authzIdDiffAccount = int64(5)
-)
-
 // GetAuthorization2 is a mock
 func (sa *StorageAuthorityReadOnly) GetAuthorization2(ctx context.Context, id *sapb.AuthorizationID2, _ ...grpc.CallOption) (*corepb.Authorization, error) {
-	authz := core.Authorization{
-		Status:         core.StatusValid,
-		RegistrationID: 1,
-		Identifier:     identifier.DNSIdentifier("not-an-example.com"),
-		Challenges: []core.Challenge{
-			{
-				Status: "pending",
-				Token:  "token",
-				Type:   "dns",
-			},
-		},
-	}
-
-	switch id.Id {
-	case authzIdValid:
-		exp := sa.clk.Now().AddDate(100, 0, 0)
-		authz.Expires = &exp
-		authz.ID = fmt.Sprintf("%d", authzIdValid)
-		return bgrpc.AuthzToPB(authz)
-	case authzIdPending:
-		exp := sa.clk.Now().AddDate(100, 0, 0)
-		authz.Expires = &exp
-		authz.ID = fmt.Sprintf("%d", authzIdPending)
-		authz.Status = core.StatusPending
-		return bgrpc.AuthzToPB(authz)
-	case authzIdExpired:
-		exp := sa.clk.Now().AddDate(0, -1, 0)
-		authz.Expires = &exp
-		authz.ID = fmt.Sprintf("%d", authzIdExpired)
-		return bgrpc.AuthzToPB(authz)
-	case authzIdErrorResult:
-		return nil, fmt.Errorf("unspecified database error")
-	case authzIdDiffAccount:
-		exp := sa.clk.Now().AddDate(100, 0, 0)
-		authz.RegistrationID = 2
-		authz.Expires = &exp
-		authz.ID = fmt.Sprintf("%d", authzIdDiffAccount)
-		return bgrpc.AuthzToPB(authz)
-	}
-
-	return nil, berrors.NotFoundError("no authorization found with id %q", id)
+	return &corepb.Authorization{}, nil
 }
 
 // GetSerialsByKey is a mock

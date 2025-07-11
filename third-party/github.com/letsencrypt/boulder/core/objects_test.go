@@ -4,7 +4,7 @@ import (
 	"crypto/rsa"
 	"encoding/json"
 	"math/big"
-	"net"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -39,8 +39,8 @@ func TestRecordSanityCheckOnUnsupportedChallengeType(t *testing.T) {
 			URL:               "http://localhost/test",
 			Hostname:          "localhost",
 			Port:              "80",
-			AddressesResolved: []net.IP{{127, 0, 0, 1}},
-			AddressUsed:       net.IP{127, 0, 0, 1},
+			AddressesResolved: []netip.Addr{netip.MustParseAddr("127.0.0.1")},
+			AddressUsed:       netip.MustParseAddr("127.0.0.1"),
 			ResolverAddrs:     []string{"eastUnboundAndDown"},
 		},
 	}
@@ -100,7 +100,7 @@ func TestAuthorizationSolvedBy(t *testing.T) {
 		{
 			Name:          "No challenges",
 			Authz:         Authorization{},
-			ExpectedError: "Authorization has no challenges",
+			ExpectedError: "authorization has no challenges",
 		},
 		// An authz with all non-valid challenges should return nil
 		{
@@ -108,7 +108,7 @@ func TestAuthorizationSolvedBy(t *testing.T) {
 			Authz: Authorization{
 				Challenges: []Challenge{HTTPChallenge01(""), DNSChallenge01("")},
 			},
-			ExpectedError: "Authorization not solved by any challenge",
+			ExpectedError: "authorization not solved by any challenge",
 		},
 		// An authz with one valid HTTP01 challenge amongst other challenges should
 		// return the HTTP01 challenge

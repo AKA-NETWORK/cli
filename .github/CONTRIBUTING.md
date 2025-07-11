@@ -86,5 +86,5 @@ A member of the core team will [triage](../docs/triage.md) the design proposal. 
 [How to Contribute to Open Source]: https://opensource.guide/how-to-contribute/
 [Using Pull Requests]: https://docs.github.com/en/free-pro-team@latest/github/collaborating-with-issues-and-pull-requests/about-pull-requests
 [GitHub Help]: https://docs.github.com/
-[CLI Design System]: https://primer.style/cli/
+[CLI Design System]: /docs/primer/
 [Google Docs Template]: https://docs.google.com/document/d/1JIRErIUuJ6fTgabiFYfCH3x91pyHuytbfa0QLnTfXKM/edit#heading=h.or54sa47ylpg

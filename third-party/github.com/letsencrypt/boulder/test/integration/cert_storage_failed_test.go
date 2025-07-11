@@ -13,10 +13,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/eggsampler/acme/v3"
 	_ "github.com/go-sql-driver/mysql"
 	"golang.org/x/crypto/ocsp"
 
@@ -29,8 +31,8 @@ import (
 
 // getPrecertByName finds and parses a precertificate using the given hostname.
 // It returns the most recent one.
-func getPrecertByName(db *sql.DB, name string) (*x509.Certificate, error) {
-	name = sa.ReverseName(name)
+func getPrecertByName(db *sql.DB, reversedName string) (*x509.Certificate, error) {
+	reversedName = sa.EncodeIssuedName(reversedName)
 	// Find the certificate from the precertificates table. We don't know the serial so
 	// we have to look it up by name.
 	var der []byte
@@ -41,7 +43,7 @@ func getPrecertByName(db *sql.DB, name string) (*x509.Certificate, error) {
 		WHERE reversedName = ?
 		ORDER BY issuedNames.id DESC
 		LIMIT 1
-	`, name)
+	`, reversedName)
 	for rows.Next() {
 		err = rows.Scan(&der)
 		if err != nil {
@@ -49,7 +51,7 @@ func getPrecertByName(db *sql.DB, name string) (*x509.Certificate, error) {
 		}
 	}
 	if der == nil {
-		return nil, fmt.Errorf("no precertificate found for %q", name)
+		return nil, fmt.Errorf("no precertificate found for %q", reversedName)
 	}
 
 	cert, err := x509.ParseCertificate(der)
@@ -62,7 +64,7 @@ func getPrecertByName(db *sql.DB, name string) (*x509.Certificate, error) {
 
 // expectOCSP500 queries OCSP for the given certificate and expects a 500 error.
 func expectOCSP500(cert *x509.Certificate) error {
-	_, err := ocsp_helper.Req(cert, ocsp_helper.DefaultConfig)
+	_, err := ocsp_helper.Req(cert, ocspConf())
 	if err == nil {
 		return errors.New("Expected error getting OCSP for certificate that failed status storage")
 	}
@@ -91,16 +93,9 @@ func expectOCSP500(cert *x509.Certificate) error {
 // that a final certificate exists for any precertificate, though it is
 // similar in spirit).
 func TestIssuanceCertStorageFailed(t *testing.T) {
-	t.Parallel()
 	os.Setenv("DIRECTORY", "http://boulder.service.consul:4001/directory")
 
 	ctx := context.Background()
-
-	// This test is gated on the StoreLintingCertificateInsteadOfPrecertificate
-	// feature flag.
-	if os.Getenv("BOULDER_CONFIG_DIR") != "test/config-next" {
-		t.Skip("Skipping test because it requires the StoreLintingCertificateInsteadOfPrecertificate feature flag")
-	}
 
 	db, err := sql.Open("mysql", vars.DBConnSAIntegrationFullPerms)
 	test.AssertNotError(t, err, "failed to open db connection")
@@ -143,7 +138,7 @@ func TestIssuanceCertStorageFailed(t *testing.T) {
 	// ---- Test revocation by serial ----
 	revokeMeDomain := "revokeme.wantserror.com"
 	// This should fail because the trigger prevented setting the certificate status to "ready"
-	_, err = authAndIssue(nil, certKey, []string{revokeMeDomain}, true)
+	_, err = authAndIssue(nil, certKey, []acme.Identifier{{Type: "dns", Value: revokeMeDomain}}, true, "")
 	test.AssertError(t, err, "expected authAndIssue to fail")
 
 	cert, err := getPrecertByName(db, revokeMeDomain)
@@ -170,7 +165,7 @@ func TestIssuanceCertStorageFailed(t *testing.T) {
 	// ---- Test revocation by key ----
 	blockMyKeyDomain := "blockmykey.wantserror.com"
 	// This should fail because the trigger prevented setting the certificate status to "ready"
-	_, err = authAndIssue(nil, certKey, []string{blockMyKeyDomain}, true)
+	_, err = authAndIssue(nil, certKey, []acme.Identifier{{Type: "dns", Value: blockMyKeyDomain}}, true, "")
 	test.AssertError(t, err, "expected authAndIssue to fail")
 
 	cert, err = getPrecertByName(db, blockMyKeyDomain)
@@ -183,10 +178,11 @@ func TestIssuanceCertStorageFailed(t *testing.T) {
 	// with the same key, then revoking that certificate for keyCompromise.
 	revokeClient, err := makeClient()
 	test.AssertNotError(t, err, "creating second acme client")
-	res, err := authAndIssue(nil, certKey, []string{random_domain()}, true)
+	res, err := authAndIssue(nil, certKey, []acme.Identifier{{Type: "dns", Value: random_domain()}}, true, "")
 	test.AssertNotError(t, err, "issuing second cert")
 
 	successfulCert := res.certs[0]
+	successfulCertIssuer := res.certs[1]
 	err = revokeClient.RevokeCertificate(
 		revokeClient.Account,
 		successfulCert,
@@ -195,9 +191,12 @@ func TestIssuanceCertStorageFailed(t *testing.T) {
 	)
 	test.AssertNotError(t, err, "revoking second certificate")
 
+	runUpdater(t, path.Join(os.Getenv("BOULDER_CONFIG_DIR"), "crl-updater.json"))
+	fetchAndCheckRevoked(t, successfulCert, successfulCertIssuer, ocsp.KeyCompromise)
+
 	for range 300 {
 		_, err = ocsp_helper.Req(successfulCert,
-			ocsp_helper.DefaultConfig.WithExpectStatus(ocsp.Revoked).WithExpectReason(ocsp.KeyCompromise))
+			ocspConf().WithExpectStatus(ocsp.Revoked).WithExpectReason(ocsp.KeyCompromise))
 		if err == nil {
 			break
 		}
@@ -206,7 +205,7 @@ func TestIssuanceCertStorageFailed(t *testing.T) {
 	test.AssertNotError(t, err, "expected status to eventually become revoked")
 
 	// Try to issue again with the same key, expecting an error because of the key is blocked.
-	_, err = authAndIssue(nil, certKey, []string{"123.example.com"}, true)
+	_, err = authAndIssue(nil, certKey, []acme.Identifier{{Type: "dns", Value: "123.example.com"}}, true, "")
 	test.AssertError(t, err, "expected authAndIssue to fail")
 	if !strings.Contains(err.Error(), "public key is forbidden") {
 		t.Errorf("expected issuance to be rejected with a bad pubkey")

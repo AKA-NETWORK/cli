@@ -149,15 +149,16 @@ func formatQualifiers(qs Qualifiers) []string {
 }
 
 func formatKeywords(ks []string) []string {
+	result := make([]string, len(ks))
 	for i, k := range ks {
 		before, after, found := strings.Cut(k, ":")
 		if !found {
-			ks[i] = quote(k)
+			result[i] = quote(k)
 		} else {
-			ks[i] = fmt.Sprintf("%s:%s", before, quote(after))
+			result[i] = fmt.Sprintf("%s:%s", before, quote(after))
 		}
 	}
-	return ks
+	return result
 }
 
 // CamelToKebab returns a copy of the string s that is converted from camel case form to '-' separated form.

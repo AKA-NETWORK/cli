@@ -11,6 +11,7 @@ import (
 	"github.com/letsencrypt/boulder/cmd"
 	"github.com/letsencrypt/boulder/features"
 	bgrpc "github.com/letsencrypt/boulder/grpc"
+	"github.com/letsencrypt/boulder/iana"
 	"github.com/letsencrypt/boulder/va"
 	vaConfig "github.com/letsencrypt/boulder/va/config"
 	vapb "github.com/letsencrypt/boulder/va/proto"
@@ -19,6 +20,25 @@ import (
 type Config struct {
 	RVA struct {
 		vaConfig.Common
+
+		// Perspective uniquely identifies the Network Perspective used to
+		// perform the validation, as specified in BRs Section 5.4.1,
+		// Requirement 2.7 ("Multi-Perspective Issuance Corroboration attempts
+		// from each Network Perspective"). It should uniquely identify a group
+		// of RVAs deployed in the same datacenter.
+		Perspective string `omitempty:"required"`
+
+		// RIR indicates the Regional Internet Registry where this RVA is
+		// located. This field is used to identify the RIR region from which a
+		// given validation was performed, as specified in the "Phased
+		// Implementation Timeline" in BRs Section 3.2.2.9. It must be one of
+		// the following values:
+		//   - ARIN
+		//   - RIPE
+		//   - APNIC
+		//   - LACNIC
+		//   - AFRINIC
+		RIR string `validate:"required,oneof=ARIN RIPE APNIC LACNIC AFRINIC"`
 
 		// SkipGRPCClientCertVerification, when disabled as it should typically
 		// be, will cause the remoteva server (which receives gRPCs from a
@@ -67,16 +87,12 @@ func main() {
 	clk := cmd.Clock()
 
 	var servers bdns.ServerProvider
-	proto := "udp"
-	if features.Get().DOH {
-		proto = "tcp"
-	}
 
 	if len(c.RVA.DNSStaticResolvers) != 0 {
 		servers, err = bdns.NewStaticProvider(c.RVA.DNSStaticResolvers)
 		cmd.FailOnError(err, "Couldn't start static DNS server resolver")
 	} else {
-		servers, err = bdns.StartDynamicProvider(c.RVA.DNSProvider, 60*time.Second, proto)
+		servers, err = bdns.StartDynamicProvider(c.RVA.DNSProvider, 60*time.Second, "tcp")
 		cmd.FailOnError(err, "Couldn't start dynamic DNS server resolver")
 	}
 	defer servers.Stop()
@@ -96,6 +112,7 @@ func main() {
 			scope,
 			clk,
 			c.RVA.DNSTries,
+			c.RVA.UserAgent,
 			logger,
 			tlsConfig)
 	} else {
@@ -105,6 +122,7 @@ func main() {
 			scope,
 			clk,
 			c.RVA.DNSTries,
+			c.RVA.UserAgent,
 			logger,
 			tlsConfig)
 	}
@@ -112,13 +130,15 @@ func main() {
 	vai, err := va.NewValidationAuthorityImpl(
 		resolver,
 		nil, // Our RVAs will never have RVAs of their own.
-		0,   // Only the VA is concerned with max validation failures
 		c.RVA.UserAgent,
 		c.RVA.IssuerDomain,
 		scope,
 		clk,
 		logger,
-		c.RVA.AccountURIPrefixes)
+		c.RVA.AccountURIPrefixes,
+		c.RVA.Perspective,
+		c.RVA.RIR,
+		iana.IsReservedAddr)
 	cmd.FailOnError(err, "Unable to create Remote-VA server")
 
 	start, err := bgrpc.NewServer(c.RVA.GRPC, logger).Add(

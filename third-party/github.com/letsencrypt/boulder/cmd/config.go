@@ -3,6 +3,7 @@ package cmd
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/letsencrypt/boulder/config"
 	"github.com/letsencrypt/boulder/core"
+	"github.com/letsencrypt/boulder/identifier"
 )
 
 // PasswordConfig contains a path to a file containing a password.
@@ -87,6 +89,8 @@ func (d *DBConfig) URL() (string, error) {
 	return strings.TrimSpace(string(url)), err
 }
 
+// SMTPConfig is deprecated.
+// TODO(#8199): Delete this when it is removed from bad-key-revoker's config.
 type SMTPConfig struct {
 	PasswordConfig
 	Server   string `validate:"required"`
@@ -98,8 +102,9 @@ type SMTPConfig struct {
 // database, what policies it should enforce, and what challenges
 // it should offer.
 type PAConfig struct {
-	DBConfig   `validate:"-"`
-	Challenges map[core.AcmeChallenge]bool `validate:"omitempty,dive,keys,oneof=http-01 dns-01 tls-alpn-01,endkeys"`
+	DBConfig    `validate:"-"`
+	Challenges  map[core.AcmeChallenge]bool        `validate:"omitempty,dive,keys,oneof=http-01 dns-01 tls-alpn-01,endkeys"`
+	Identifiers map[identifier.IdentifierType]bool `validate:"omitempty,dive,keys,oneof=dns ip,endkeys"`
 }
 
 // CheckChallenges checks whether the list of challenges in the PA config
@@ -111,6 +116,17 @@ func (pc PAConfig) CheckChallenges() error {
 	for c := range pc.Challenges {
 		if !c.IsValid() {
 			return fmt.Errorf("invalid challenge in PA config: %s", c)
+		}
+	}
+	return nil
+}
+
+// CheckIdentifiers checks whether the list of identifiers in the PA config
+// actually contains valid identifier type names
+func (pc PAConfig) CheckIdentifiers() error {
+	for i := range pc.Identifiers {
+		if !i.IsValid() {
+			return fmt.Errorf("invalid identifier type in PA config: %s", i)
 		}
 	}
 	return nil
@@ -283,7 +299,7 @@ type GRPCClientConfig struct {
 	// If you've added the above to your Consul configuration file (and reloaded
 	// Consul) then you should be able to resolve the following dig query:
 	//
-	// $ dig @10.55.55.10 -t SRV _foo._tcp.service.consul +short
+	// $ dig @10.77.77.10 -t SRV _foo._tcp.service.consul +short
 	// 1 1 8080 0a585858.addr.dc1.consul.
 	// 1 1 8080 0a4d4d4d.addr.dc1.consul.
 	SRVLookup *ServiceDomain `validate:"required_without_all=SRVLookups ServerAddress ServerIPAddresses"`
@@ -323,7 +339,7 @@ type GRPCClientConfig struct {
 	// If you've added the above to your Consul configuration file (and reloaded
 	// Consul) then you should be able to resolve the following dig query:
 	//
-	// $ dig A @10.55.55.10 foo.service.consul +short
+	// $ dig A @10.77.77.10 foo.service.consul +short
 	// 10.77.77.77
 	// 10.88.88.88
 	ServerAddress string `validate:"required_without_all=ServerIPAddresses SRVLookup SRVLookups,omitempty,hostname_port"`
@@ -449,7 +465,7 @@ type GRPCServerConfig struct {
 	// These service names must match the service names advertised by gRPC itself,
 	// which are identical to the names set in our gRPC .proto files prefixed by
 	// the package names set in those files (e.g. "ca.CertificateAuthority").
-	Services map[string]GRPCServiceConfig `json:"services" validate:"required,dive,required"`
+	Services map[string]*GRPCServiceConfig `json:"services" validate:"required,dive,required"`
 	// MaxConnectionAge specifies how long a connection may live before the server sends a GoAway to the
 	// client. Because gRPC connections re-resolve DNS after a connection close,
 	// this controls how long it takes before a client learns about changes to its
@@ -460,10 +476,10 @@ type GRPCServerConfig struct {
 
 // GRPCServiceConfig contains the information needed to configure a gRPC service.
 type GRPCServiceConfig struct {
-	// PerServiceClientNames is a map of gRPC service names to client certificate
-	// SANs. The upstream listening server will reject connections from clients
-	// which do not appear in this list, and the server interceptor will reject
-	// RPC calls for this service from clients which are not listed here.
+	// ClientNames is the list of accepted gRPC client certificate SANs.
+	// Connections from clients not in this list will be rejected by the
+	// upstream listener, and RPCs from unlisted clients will be denied by the
+	// server interceptor.
 	ClientNames []string `json:"clientNames" validate:"min=1,dive,hostname,required"`
 }
 
@@ -548,8 +564,38 @@ type DNSProvider struct {
 	// If you've added the above to your Consul configuration file (and reloaded
 	// Consul) then you should be able to resolve the following dig query:
 	//
-	// $ dig @10.55.55.10 -t SRV _unbound._udp.service.consul +short
+	// $ dig @10.77.77.10 -t SRV _unbound._udp.service.consul +short
 	// 1 1 8053 0a4d4d4d.addr.dc1.consul.
 	// 1 1 8153 0a4d4d4d.addr.dc1.consul.
 	SRVLookup ServiceDomain `validate:"required"`
+}
+
+// HMACKeyConfig specifies a path to a file containing a hexadecimal-encoded
+// HMAC key. The key must represent exactly 256 bits (32 bytes) of random data
+// to be suitable for use as a 256-bit hashing key (e.g., the output of `openssl
+// rand -hex 32`).
+type HMACKeyConfig struct {
+	KeyFile string `validate:"required"`
+}
+
+// Load reads the HMAC key from the file, decodes it from hexadecimal, ensures
+// it represents exactly 256 bits (32 bytes), and returns it as a byte slice.
+func (hc *HMACKeyConfig) Load() ([]byte, error) {
+	contents, err := os.ReadFile(hc.KeyFile)
+	if err != nil {
+		return nil, err
+	}
+
+	decoded, err := hex.DecodeString(strings.TrimSpace(string(contents)))
+	if err != nil {
+		return nil, fmt.Errorf("invalid hexadecimal encoding: %w", err)
+	}
+
+	if len(decoded) != 32 {
+		return nil, fmt.Errorf(
+			"validating HMAC key, must be exactly 256 bits (32 bytes) after decoding, got %d",
+			len(decoded),
+		)
+	}
+	return decoded, nil
 }

@@ -4,15 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"net"
+	"net/netip"
 	"strconv"
 	"sync"
 	"time"
 
-	"github.com/letsencrypt/boulder/cmd"
 	"github.com/miekg/dns"
 	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/letsencrypt/boulder/cmd"
 )
 
 // ServerProvider represents a type which can provide a list of addresses for
@@ -60,10 +62,9 @@ func validateServerAddress(address string) error {
 	}
 
 	// Ensure the `host` portion of `address` is a valid FQDN or IP address.
-	IPv6 := net.ParseIP(host).To16()
-	IPv4 := net.ParseIP(host).To4()
+	_, err = netip.ParseAddr(host)
 	FQDN := dns.IsFqdn(dns.Fqdn(host))
-	if IPv6 == nil && IPv4 == nil && !FQDN {
+	if err != nil && !FQDN {
 		return errors.New("host is not an FQDN or IP address")
 	}
 	return nil
@@ -306,7 +307,7 @@ func (dp *dynamicProvider) Addrs() ([]string, error) {
 	var r []string
 	dp.mu.RLock()
 	for ip, ports := range dp.addrs {
-		port := fmt.Sprint(ports[rand.Intn(len(ports))])
+		port := fmt.Sprint(ports[rand.IntN(len(ports))])
 		addr := net.JoinHostPort(ip, port)
 		r = append(r, addr)
 	}

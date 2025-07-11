@@ -22,14 +22,20 @@ import (
 	"github.com/letsencrypt/boulder/test"
 )
 
-func defaultProfileConfig() ProfileConfig {
-	return ProfileConfig{
-		AllowCommonName:     true,
-		AllowCTPoison:       true,
-		AllowSCTList:        true,
-		AllowMustStaple:     true,
-		MaxValidityPeriod:   config.Duration{Duration: time.Hour},
-		MaxValidityBackdate: config.Duration{Duration: time.Hour},
+func defaultProfileConfig() *ProfileConfig {
+	return &ProfileConfig{
+		AllowMustStaple:              true,
+		IncludeCRLDistributionPoints: true,
+		MaxValidityPeriod:            config.Duration{Duration: time.Hour},
+		MaxValidityBackdate:          config.Duration{Duration: time.Hour},
+		IgnoredLints: []string{
+			// Ignore the two SCT lints because these tests don't get SCTs.
+			"w_ct_sct_policy_count_unsatisfied",
+			"e_scts_from_same_operator",
+			// Ignore the warning about including the SubjectKeyIdentifier extension:
+			// we include it on purpose, but plan to remove it soon.
+			"w_ext_subject_key_identifier_not_recommended_subscriber",
+		},
 	}
 }
 
@@ -37,8 +43,8 @@ func defaultIssuerConfig() IssuerConfig {
 	return IssuerConfig{
 		Active:     true,
 		IssuerURL:  "http://issuer-url.example.org",
-		OCSPURL:    "http://ocsp-url.example.org",
 		CRLURLBase: "http://crl-url.example.org/",
+		CRLShards:  10,
 	}
 }
 
@@ -78,7 +84,6 @@ func TestLoadCertificate(t *testing.T) {
 		{"happy path", "../test/hierarchy/int-e1.cert.pem", ""},
 	}
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			_, err := LoadCertificate(tc.path)
@@ -115,14 +120,13 @@ func TestLoadSigner(t *testing.T) {
 		{"invalid key file", IssuerLoc{File: "../test/hierarchy/int-e1.crl.pem"}, "unable to parse"},
 		{"ECDSA key file", IssuerLoc{File: "../test/hierarchy/int-e1.key.pem"}, ""},
 		{"RSA key file", IssuerLoc{File: "../test/hierarchy/int-r3.key.pem"}, ""},
-		{"invalid config file", IssuerLoc{ConfigFile: "../test/example-weak-keys.json"}, "json: cannot unmarshal"},
+		{"invalid config file", IssuerLoc{ConfigFile: "../test/hostname-policy.yaml"}, "invalid character"},
 		// Note that we don't have a test for "valid config file" because it would
 		// always fail -- in CI, the softhsm hasn't been initialized, so there's no
 		// key to look up; locally even if the softhsm has been initialized, the
 		// keys in it don't match the fakeKey we generated above.
 	}
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			_, err := loadSigner(tc.loc, fakeKey.Public())
@@ -180,7 +184,6 @@ func TestNewIssuerKeyUsage(t *testing.T) {
 		{"all three", x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature, ""},
 	}
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			_, err := newIssuer(

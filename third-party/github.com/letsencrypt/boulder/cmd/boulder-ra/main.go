@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"os"
-	"time"
 
 	akamaipb "github.com/letsencrypt/boulder/akamai/proto"
 	capb "github.com/letsencrypt/boulder/ca/proto"
@@ -25,6 +24,7 @@ import (
 	"github.com/letsencrypt/boulder/ratelimits"
 	bredis "github.com/letsencrypt/boulder/redis"
 	sapb "github.com/letsencrypt/boulder/sa/proto"
+	"github.com/letsencrypt/boulder/va"
 	vapb "github.com/letsencrypt/boulder/va/proto"
 )
 
@@ -33,7 +33,8 @@ type Config struct {
 		cmd.ServiceConfig
 		cmd.HostnamePolicyConfig
 
-		RateLimitPoliciesFilename string `validate:"required"`
+		// RateLimitPoliciesFilename is deprecated.
+		RateLimitPoliciesFilename string
 
 		MaxContactsPerRegistration int
 
@@ -76,25 +77,34 @@ type Config struct {
 		// limits are per section 7.1 of our combined CP/CPS, under "DV-SSL
 		// Subscriber Certificate". The value must match the CA and WFE
 		// configurations.
-		MaxNames int `validate:"required,min=1,max=100"`
+		//
+		// Deprecated: Set ValidationProfiles[*].MaxNames instead.
+		MaxNames int `validate:"omitempty,min=1,max=100"`
 
-		// AuthorizationLifetimeDays defines how long authorizations will be
-		// considered valid for. Given a value of 300 days when used with a 90-day
-		// cert lifetime, this allows creation of certs that will cover a whole
-		// year, plus a grace period of a month.
-		AuthorizationLifetimeDays int `validate:"required,min=1,max=397"`
+		// ValidationProfiles is a map of validation profiles to their
+		// respective issuance allow lists. If a profile is not included in this
+		// mapping, it cannot be used by any account. If this field is left
+		// empty, all profiles are open to all accounts.
+		ValidationProfiles map[string]*ra.ValidationProfileConfig `validate:"required"`
 
-		// PendingAuthorizationLifetimeDays defines how long authorizations may be in
-		// the pending state. If you can't respond to a challenge this quickly, then
-		// you need to request a new challenge.
-		PendingAuthorizationLifetimeDays int `validate:"required,min=1,max=29"`
+		// DefaultProfileName sets the profile to use if one wasn't provided by the
+		// client in the new-order request. Must match a configured validation
+		// profile or the RA will fail to start. Must match a certificate profile
+		// configured in the CA or finalization will fail for orders using this
+		// default.
+		DefaultProfileName string `validate:"required"`
+
+		// MustStapleAllowList specified the path to a YAML file containing a
+		// list of account IDs permitted to request certificates with the OCSP
+		// Must-Staple extension.
+		//
+		// Deprecated: This field no longer has any effect, all Must-Staple requests
+		// are rejected.
+		// TODO(#8177): Remove this field.
+		MustStapleAllowList string `validate:"omitempty"`
 
 		// GoodKey is an embedded config stanza for the goodkey library.
 		GoodKey goodkey.Config
-
-		// OrderLifetime is how far in the future an Order's expiration date should
-		// be set when it is first created.
-		OrderLifetime config.Duration
 
 		// FinalizeTimeout is how long the RA is willing to wait for the Order
 		// finalization process to take. This config parameter only has an effect
@@ -113,11 +123,6 @@ type Config struct {
 		// a `Stagger` value controlling how long we wait for one operator group
 		// to respond before trying a different one.
 		CTLogs ctconfig.CTConfig
-		// InformationalCTLogs are a set of CT logs we will always submit to
-		// but won't ever use the SCTs from. This may be because we want to
-		// test them or because they are not yet approved by a browser/root
-		// program but we still want our certs to end up there.
-		InformationalCTLogs []ctconfig.LogDescription
 
 		// IssuerCerts are paths to all intermediate certificates which may have
 		// been used to issue certificates in the last 90 days. These are used to
@@ -162,8 +167,9 @@ func main() {
 
 	// Validate PA config and set defaults if needed
 	cmd.FailOnError(c.PA.CheckChallenges(), "Invalid PA configuration")
+	cmd.FailOnError(c.PA.CheckIdentifiers(), "Invalid PA configuration")
 
-	pa, err := policy.New(c.PA.Challenges, logger)
+	pa, err := policy.New(c.PA.Identifiers, c.PA.Challenges, logger)
 	cmd.FailOnError(err, "Couldn't create PA")
 
 	if c.RA.HostnamePolicyFile == "" {
@@ -232,23 +238,22 @@ func main() {
 
 	ctp = ctpolicy.New(pubc, sctLogs, infoLogs, finalLogs, c.RA.CTLogs.Stagger.Duration, logger, scope)
 
-	// Baseline Requirements v1.8.1 section 4.2.1: "any reused data, document,
-	// or completed validation MUST be obtained no more than 398 days prior
-	// to issuing the Certificate". If unconfigured or the configured value is
-	// greater than 397 days, bail out.
-	if c.RA.AuthorizationLifetimeDays <= 0 || c.RA.AuthorizationLifetimeDays > 397 {
-		cmd.Fail("authorizationLifetimeDays value must be greater than 0 and less than 398")
+	if len(c.RA.ValidationProfiles) == 0 {
+		cmd.Fail("At least one profile must be configured")
 	}
-	authorizationLifetime := time.Duration(c.RA.AuthorizationLifetimeDays) * 24 * time.Hour
 
-	// The Baseline Requirements v1.8.1 state that validation tokens "MUST
-	// NOT be used for more than 30 days from its creation". If unconfigured
-	// or the configured value pendingAuthorizationLifetimeDays is greater
-	// than 29 days, bail out.
-	if c.RA.PendingAuthorizationLifetimeDays <= 0 || c.RA.PendingAuthorizationLifetimeDays > 29 {
-		cmd.Fail("pendingAuthorizationLifetimeDays value must be greater than 0 and less than 30")
+	// TODO(#7993): Remove this fallback and make ValidationProfile.MaxNames a
+	// required config field. We don't do any validation on the value of this
+	// top-level MaxNames because that happens inside the call to
+	// NewValidationProfiles below.
+	for _, pc := range c.RA.ValidationProfiles {
+		if pc.MaxNames == 0 {
+			pc.MaxNames = c.RA.MaxNames
+		}
 	}
-	pendingAuthorizationLifetime := time.Duration(c.RA.PendingAuthorizationLifetimeDays) * 24 * time.Hour
+
+	validationProfiles, err := ra.NewValidationProfiles(c.RA.DefaultProfileName, c.RA.ValidationProfiles)
+	cmd.FailOnError(err, "Failed to load validation profiles")
 
 	if features.Get().AsyncFinalize && c.RA.FinalizeTimeout.Duration == 0 {
 		cmd.Fail("finalizeTimeout must be supplied when AsyncFinalize feature is enabled")
@@ -256,10 +261,6 @@ func main() {
 
 	kp, err := sagoodkey.NewPolicy(&c.RA.GoodKey, sac.KeyBlocked)
 	cmd.FailOnError(err, "Unable to create key policy")
-
-	if c.RA.MaxNames == 0 {
-		cmd.Fail("Error in RA config: MaxNames must not be 0")
-	}
 
 	var limiter *ratelimits.Limiter
 	var txnBuilder *ratelimits.TransactionBuilder
@@ -272,7 +273,7 @@ func main() {
 		source := ratelimits.NewRedisSource(limiterRedis.Ring, clk, scope)
 		limiter, err = ratelimits.NewLimiter(clk, source, scope)
 		cmd.FailOnError(err, "Failed to create rate limiter")
-		txnBuilder, err = ratelimits.NewTransactionBuilder(c.RA.Limiter.Defaults, c.RA.Limiter.Overrides)
+		txnBuilder, err = ratelimits.NewTransactionBuilderFromFiles(c.RA.Limiter.Defaults, c.RA.Limiter.Overrides)
 		cmd.FailOnError(err, "Failed to create rate limits transaction builder")
 	}
 
@@ -285,29 +286,29 @@ func main() {
 		limiter,
 		txnBuilder,
 		c.RA.MaxNames,
-		authorizationLifetime,
-		pendingAuthorizationLifetime,
+		validationProfiles,
 		pubc,
-		caaClient,
-		c.RA.OrderLifetime.Duration,
 		c.RA.FinalizeTimeout.Duration,
 		ctp,
 		apc,
 		issuerCerts,
 	)
-	defer rai.DrainFinalize()
+	defer rai.Drain()
 
-	policyErr := rai.LoadRateLimitPoliciesFile(c.RA.RateLimitPoliciesFilename)
-	cmd.FailOnError(policyErr, "Couldn't load rate limit policies file")
 	rai.PA = pa
 
-	rai.VA = vac
+	rai.VA = va.RemoteClients{
+		VAClient:  vac,
+		CAAClient: caaClient,
+	}
 	rai.CA = cac
 	rai.OCSP = ocspc
 	rai.SA = sac
 
 	start, err := bgrpc.NewServer(c.RA.GRPC, logger).Add(
-		&rapb.RegistrationAuthority_ServiceDesc, rai).Build(tlsConfig, scope, clk)
+		&rapb.RegistrationAuthority_ServiceDesc, rai).Add(
+		&rapb.SCTProvider_ServiceDesc, rai).
+		Build(tlsConfig, scope, clk)
 	cmd.FailOnError(err, "Unable to setup RA gRPC server")
 
 	cmd.FailOnError(start(), "RA gRPC service failed")

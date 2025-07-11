@@ -157,13 +157,19 @@ type IssuerConfig struct {
 	// (for which an issuance token is presented), OCSP responses, and CRLs.
 	// All Active issuers of a given key type (RSA or ECDSA) are part of a pool
 	// and each precertificate will be issued randomly from a selected pool.
-	// The selection of which pool depends on the precertificate's key algorithm,
-	// the ECDSAForAll feature flag, and the ECDSAAllowListFilename config field.
+	// The selection of which pool depends on the precertificate's key algorithm.
 	Active bool
 
 	IssuerURL  string `validate:"required,url"`
-	OCSPURL    string `validate:"required,url"`
-	CRLURLBase string `validate:"omitempty,url,startswith=http://,endswith=/"`
+	CRLURLBase string `validate:"required,url,startswith=http://,endswith=/"`
+
+	// TODO(#8177): Remove this.
+	OCSPURL string `validate:"omitempty,url"`
+
+	// Number of CRL shards.
+	// This must be nonzero if adding CRLDistributionPoints to certificates
+	// (that is, if profile.IncludeCRLDistributionPoints is true).
+	CRLShards int
 
 	Location IssuerLoc
 }
@@ -201,12 +207,11 @@ type Issuer struct {
 	// Used to set the Authority Information Access caIssuers URL in issued
 	// certificates.
 	issuerURL string
-	// Used to set the Authority Information Access ocsp URL in issued
-	// certificates.
-	ocspURL string
 	// Used to set the Issuing Distribution Point extension in issued CRLs
-	// *and* (eventually) the CRL Distribution Point extension in issued certs.
+	// and the CRL Distribution Point extension in issued certs.
 	crlURLBase string
+
+	crlShards int
 
 	clk clock.Clock
 }
@@ -236,9 +241,6 @@ func newIssuer(config IssuerConfig, cert *Certificate, signer crypto.Signer, clk
 
 	if config.IssuerURL == "" {
 		return nil, errors.New("Issuer URL is required")
-	}
-	if config.OCSPURL == "" {
-		return nil, errors.New("OCSP URL is required")
 	}
 	if config.CRLURLBase == "" {
 		return nil, errors.New("CRL URL base is required")
@@ -275,8 +277,8 @@ func newIssuer(config IssuerConfig, cert *Certificate, signer crypto.Signer, clk
 		sigAlg:     sigAlg,
 		active:     config.Active,
 		issuerURL:  config.IssuerURL,
-		ocspURL:    config.OCSPURL,
 		crlURLBase: config.CRLURLBase,
+		crlShards:  config.CRLShards,
 		clk:        clk,
 	}
 	return i, nil

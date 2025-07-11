@@ -11,32 +11,36 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/letsencrypt/boulder/config"
 	"github.com/letsencrypt/boulder/core"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/test"
-	"github.com/prometheus/client_golang/prometheus"
 )
 
 var (
 	validPAConfig = []byte(`{
   "dbConnect": "dummyDBConnect",
   "enforcePolicyWhitelist": false,
-  "challenges": { "http-01": true }
+  "challenges": { "http-01": true },
+  "identifiers": { "dns": true, "ip": true }
 }`)
 	invalidPAConfig = []byte(`{
   "dbConnect": "dummyDBConnect",
   "enforcePolicyWhitelist": false,
-  "challenges": { "nonsense": true }
+  "challenges": { "nonsense": true },
+  "identifiers": { "openpgp": true }
 }`)
-	noChallengesPAConfig = []byte(`{
+	noChallengesIdentsPAConfig = []byte(`{
   "dbConnect": "dummyDBConnect",
   "enforcePolicyWhitelist": false
 }`)
-
-	emptyChallengesPAConfig = []byte(`{
+	emptyChallengesIdentsPAConfig = []byte(`{
   "dbConnect": "dummyDBConnect",
   "enforcePolicyWhitelist": false,
-  "challenges": {}
+  "challenges": {},
+  "identifiers": {}
 }`)
 )
 
@@ -45,21 +49,25 @@ func TestPAConfigUnmarshal(t *testing.T) {
 	err := json.Unmarshal(validPAConfig, &pc1)
 	test.AssertNotError(t, err, "Failed to unmarshal PAConfig")
 	test.AssertNotError(t, pc1.CheckChallenges(), "Flagged valid challenges as bad")
+	test.AssertNotError(t, pc1.CheckIdentifiers(), "Flagged valid identifiers as bad")
 
 	var pc2 PAConfig
 	err = json.Unmarshal(invalidPAConfig, &pc2)
 	test.AssertNotError(t, err, "Failed to unmarshal PAConfig")
 	test.AssertError(t, pc2.CheckChallenges(), "Considered invalid challenges as good")
+	test.AssertError(t, pc2.CheckIdentifiers(), "Considered invalid identifiers as good")
 
 	var pc3 PAConfig
-	err = json.Unmarshal(noChallengesPAConfig, &pc3)
+	err = json.Unmarshal(noChallengesIdentsPAConfig, &pc3)
 	test.AssertNotError(t, err, "Failed to unmarshal PAConfig")
 	test.AssertError(t, pc3.CheckChallenges(), "Disallow empty challenges map")
+	test.AssertNotError(t, pc3.CheckIdentifiers(), "Disallowed empty identifiers map")
 
 	var pc4 PAConfig
-	err = json.Unmarshal(emptyChallengesPAConfig, &pc4)
+	err = json.Unmarshal(emptyChallengesIdentsPAConfig, &pc4)
 	test.AssertNotError(t, err, "Failed to unmarshal PAConfig")
 	test.AssertError(t, pc4.CheckChallenges(), "Disallow empty challenges map")
+	test.AssertNotError(t, pc4.CheckIdentifiers(), "Disallowed empty identifiers map")
 }
 
 func TestMysqlLogger(t *testing.T) {
@@ -125,16 +133,13 @@ func TestReadConfigFile(t *testing.T) {
 	test.AssertError(t, err, "ReadConfigFile('') did not error")
 
 	type config struct {
-		NotifyMailer struct {
-			DB DBConfig
-			SMTPConfig
-		}
-		Syslog SyslogConfig
+		GRPC *GRPCClientConfig
+		TLS  *TLSConfig
 	}
 	var c config
-	err = ReadConfigFile("../test/config/notify-mailer.json", &c)
-	test.AssertNotError(t, err, "ReadConfigFile(../test/config/notify-mailer.json) errored")
-	test.AssertEquals(t, c.NotifyMailer.SMTPConfig.Server, "localhost")
+	err = ReadConfigFile("../test/config/health-checker.json", &c)
+	test.AssertNotError(t, err, "ReadConfigFile(../test/config/health-checker.json) errored")
+	test.AssertEquals(t, c.GRPC.Timeout.Duration, 1*time.Second)
 }
 
 func TestLogWriter(t *testing.T) {
@@ -196,9 +201,11 @@ func loadConfigFile(t *testing.T, path string) *os.File {
 
 func TestFailedConfigValidation(t *testing.T) {
 	type FooConfig struct {
-		VitalValue       string `yaml:"vitalValue" validate:"required"`
-		VoluntarilyVoid  string `yaml:"voluntarilyVoid"`
-		VisciouslyVetted string `yaml:"visciouslyVetted" validate:"omitempty,endswith=baz"`
+		VitalValue       string          `yaml:"vitalValue" validate:"required"`
+		VoluntarilyVoid  string          `yaml:"voluntarilyVoid"`
+		VisciouslyVetted string          `yaml:"visciouslyVetted" validate:"omitempty,endswith=baz"`
+		VolatileVagary   config.Duration `yaml:"volatileVagary" validate:"required,lte=120s"`
+		VernalVeil       config.Duration `yaml:"vernalVeil" validate:"required"`
 	}
 
 	// Violates 'endswith' tag JSON.
@@ -228,6 +235,34 @@ func TestFailedConfigValidation(t *testing.T) {
 	err = ValidateYAMLConfig(&ConfigValidator{&FooConfig{}, nil}, cf)
 	test.AssertError(t, err, "Expected validation error")
 	test.AssertContains(t, err.Error(), "'required'")
+
+	// Violates 'lte' tag JSON for config.Duration type.
+	cf = loadConfigFile(t, "testdata/3_configDuration_too_darn_big.json")
+	defer cf.Close()
+	err = ValidateJSONConfig(&ConfigValidator{&FooConfig{}, nil}, cf)
+	test.AssertError(t, err, "Expected validation error")
+	test.AssertContains(t, err.Error(), "'lte'")
+
+	// Violates 'lte' tag JSON for config.Duration type.
+	cf = loadConfigFile(t, "testdata/3_configDuration_too_darn_big.json")
+	defer cf.Close()
+	err = ValidateJSONConfig(&ConfigValidator{&FooConfig{}, nil}, cf)
+	test.AssertError(t, err, "Expected validation error")
+	test.AssertContains(t, err.Error(), "'lte'")
+
+	// Incorrect value for the config.Duration type.
+	cf = loadConfigFile(t, "testdata/4_incorrect_data_for_type.json")
+	defer cf.Close()
+	err = ValidateJSONConfig(&ConfigValidator{&FooConfig{}, nil}, cf)
+	test.AssertError(t, err, "Expected error")
+	test.AssertContains(t, err.Error(), "missing unit in duration")
+
+	// Incorrect value for the config.Duration type.
+	cf = loadConfigFile(t, "testdata/4_incorrect_data_for_type.yaml")
+	defer cf.Close()
+	err = ValidateYAMLConfig(&ConfigValidator{&FooConfig{}, nil}, cf)
+	test.AssertError(t, err, "Expected error")
+	test.AssertContains(t, err.Error(), "missing unit in duration")
 }
 
 func TestFailExit(t *testing.T) {
@@ -241,9 +276,6 @@ func TestFailExit(t *testing.T) {
 		return
 	}
 
-	// gosec points out that os.Args[0] is tainted, but we only run this as a test
-	// so we are not worried about it containing an untrusted value.
-	//nolint:gosec
 	cmd := exec.Command(os.Args[0], "-test.run=TestFailExit")
 	cmd.Env = append(os.Environ(), "TIME_TO_DIE=1")
 	output, err := cmd.CombinedOutput()
@@ -256,7 +288,7 @@ func TestFailExit(t *testing.T) {
 
 func testPanicStackTraceHelper() {
 	var x *int
-	*x = 1 //nolint:govet
+	*x = 1 //nolint: govet // Purposeful nil pointer dereference to trigger a panic
 }
 
 func TestPanicStackTrace(t *testing.T) {
@@ -270,9 +302,6 @@ func TestPanicStackTrace(t *testing.T) {
 		return
 	}
 
-	// gosec points out that os.Args[0] is tainted, but we only run this as a test
-	// so we are not worried about it containing an untrusted value.
-	//nolint:gosec
 	cmd := exec.Command(os.Args[0], "-test.run=TestPanicStackTrace")
 	cmd.Env = append(os.Environ(), "AT_THE_DISCO=1")
 	output, err := cmd.CombinedOutput()

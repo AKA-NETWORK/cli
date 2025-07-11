@@ -3,11 +3,10 @@ package notmain
 import (
 	"context"
 	"flag"
+	"fmt"
 	"os"
-	"reflect"
+	"strconv"
 	"time"
-
-	"github.com/zmap/zlint/v3/lint"
 
 	"github.com/letsencrypt/boulder/ca"
 	capb "github.com/letsencrypt/boulder/ca/proto"
@@ -19,8 +18,8 @@ import (
 	"github.com/letsencrypt/boulder/goodkey/sagoodkey"
 	bgrpc "github.com/letsencrypt/boulder/grpc"
 	"github.com/letsencrypt/boulder/issuance"
-	"github.com/letsencrypt/boulder/linter"
 	"github.com/letsencrypt/boulder/policy"
+	rapb "github.com/letsencrypt/boulder/ra/proto"
 	sapb "github.com/letsencrypt/boulder/sa/proto"
 )
 
@@ -34,37 +33,39 @@ type Config struct {
 
 		SAService *cmd.GRPCClientConfig
 
+		SCTService *cmd.GRPCClientConfig
+
 		// Issuance contains all information necessary to load and initialize issuers.
 		Issuance struct {
 			// The name of the certificate profile to use if one wasn't provided
 			// by the RA during NewOrder and Finalize requests. Must match a
 			// configured certificate profile or boulder-ca will fail to start.
+			//
+			// Deprecated: set the defaultProfileName in the RA config instead.
 			DefaultCertificateProfileName string `validate:"omitempty,alphanum,min=1,max=32"`
 
-			// TODO(#7414) Remove this deprecated field.
-			// Deprecated: Use CertProfiles instead. Profile implicitly takes
-			// the internal Boulder default value of ca.DefaultCertProfileName.
-			Profile issuance.ProfileConfig `validate:"required_without=CertProfiles,structonly"`
-
-			// One of the profile names must match the value of
-			// DefaultCertificateProfileName or boulder-ca will fail to start.
-			CertProfiles map[string]issuance.ProfileConfig `validate:"dive,keys,alphanum,min=1,max=32,endkeys,required_without=Profile,structonly"`
+			// One of the profile names must match the value of ra.defaultProfileName
+			// or large amounts of issuance will fail.
+			CertProfiles map[string]*issuance.ProfileConfig `validate:"dive,keys,alphanum,min=1,max=32,endkeys,required_without=Profile,structonly"`
 
 			// TODO(#7159): Make this required once all live configs are using it.
-			CRLProfile   issuance.CRLProfileConfig `validate:"-"`
-			Issuers      []issuance.IssuerConfig   `validate:"min=1,dive"`
-			LintConfig   string
-			IgnoredLints []string
+			CRLProfile issuance.CRLProfileConfig `validate:"-"`
+			Issuers    []issuance.IssuerConfig   `validate:"min=1,dive"`
 		}
 
-		// How long issued certificates are valid for.
-		Expiry config.Duration
-
-		// How far back certificates should be backdated.
-		Backdate config.Duration
-
 		// What digits we should prepend to serials after randomly generating them.
-		SerialPrefix int `validate:"required,min=1,max=127"`
+		// Deprecated: Use SerialPrefixHex instead.
+		SerialPrefix int `validate:"required_without=SerialPrefixHex,omitempty,min=1,max=127"`
+
+		// SerialPrefixHex is the hex string to prepend to serials after randomly
+		// generating them. The minimum value is "01" to ensure that at least
+		// one bit in the prefix byte is set. The maximum value is "7f" to
+		// ensure that the first bit in the prefix byte is not set. The validate
+		// library cannot enforce mix/max values on strings, so that is done in
+		// NewCertificateAuthorityImpl.
+		//
+		// TODO(#7213): Replace `required_without` with `required` when SerialPrefix is removed.
+		SerialPrefixHex string `validate:"required_without=SerialPrefix,omitempty,hexadecimal,len=2"`
 
 		// MaxNames is the maximum number of subjectAltNames in a single cert.
 		// The value supplied MUST be greater than 0 and no more than 100. These
@@ -76,12 +77,6 @@ type Config struct {
 		// LifespanOCSP is how long OCSP responses are valid for. Per the BRs,
 		// Section 4.9.10, it MUST NOT be more than 10 days. Default 96h.
 		LifespanOCSP config.Duration
-
-		// LifespanCRL is how long CRLs are valid for. It should be longer than the
-		// `period` field of the CRL Updater. Per the BRs, Section 4.9.7, it MUST
-		// NOT be more than 10 days.
-		// Deprecated: Use Config.CA.Issuance.CRLProfile.ValidityInterval instead.
-		LifespanCRL config.Duration `validate:"-"`
 
 		// GoodKey is an embedded config stanza for the goodkey library.
 		GoodKey goodkey.Config
@@ -99,10 +94,6 @@ type Config struct {
 		// of bytes and log system resources.
 		// Recommended to be around 500ms.
 		OCSPLogPeriod config.Duration
-
-		// Path of a YAML file containing the list of int64 RegIDs
-		// allowed to request ECDSA issuance
-		ECDSAAllowListFilename string
 
 		// CTLogListFile is the path to a JSON file on disk containing the set of
 		// all logs trusted by Chrome. The file must match the v3 log list schema:
@@ -151,21 +142,19 @@ func main() {
 		c.CA.DebugAddr = *debugAddr
 	}
 
+	serialPrefix := byte(c.CA.SerialPrefix)
+	if c.CA.SerialPrefixHex != "" {
+		parsedSerialPrefix, err := strconv.ParseUint(c.CA.SerialPrefixHex, 16, 8)
+		cmd.FailOnError(err, "Couldn't convert SerialPrefixHex to int")
+		serialPrefix = byte(parsedSerialPrefix)
+	}
+
 	if c.CA.MaxNames == 0 {
 		cmd.Fail("Error in CA config: MaxNames must not be 0")
 	}
 
 	if c.CA.LifespanOCSP.Duration == 0 {
 		c.CA.LifespanOCSP.Duration = 96 * time.Hour
-	}
-
-	// TODO(#7159): Remove these fallbacks once all live configs are setting the
-	// CRL validity interval inside the Issuance.CRLProfile Config.
-	if c.CA.Issuance.CRLProfile.ValidityInterval.Duration == 0 && c.CA.LifespanCRL.Duration != 0 {
-		c.CA.Issuance.CRLProfile.ValidityInterval = c.CA.LifespanCRL
-	}
-	if c.CA.Issuance.CRLProfile.MaxBackdate.Duration == 0 && c.CA.Backdate.Duration != 0 {
-		c.CA.Issuance.CRLProfile.MaxBackdate = c.CA.Backdate
 	}
 
 	scope, logger, oTelShutdown := cmd.StatsAndLogging(c.Syslog, c.OpenTelemetry, c.CA.DebugAddr)
@@ -175,8 +164,9 @@ func main() {
 	metrics := ca.NewCAMetrics(scope)
 
 	cmd.FailOnError(c.PA.CheckChallenges(), "Invalid PA configuration")
+	cmd.FailOnError(c.PA.CheckIdentifiers(), "Invalid PA configuration")
 
-	pa, err := policy.New(c.PA.Challenges, logger)
+	pa, err := policy.New(c.PA.Identifiers, c.PA.Challenges, logger)
 	cmd.FailOnError(err, "Couldn't create PA")
 
 	if c.CA.HostnamePolicyFile == "" {
@@ -192,58 +182,44 @@ func main() {
 		cmd.FailOnError(err, "Failed to load CT Log List")
 	}
 
+	clk := cmd.Clock()
+	var crlShards int
 	issuers := make([]*issuance.Issuer, 0, len(c.CA.Issuance.Issuers))
-	for _, issuerConfig := range c.CA.Issuance.Issuers {
-		issuer, err := issuance.LoadIssuer(issuerConfig, cmd.Clock())
+	for i, issuerConfig := range c.CA.Issuance.Issuers {
+		issuer, err := issuance.LoadIssuer(issuerConfig, clk)
 		cmd.FailOnError(err, "Loading issuer")
+		// All issuers should have the same number of CRL shards, because
+		// crl-updater assumes they all have the same number.
+		if issuerConfig.CRLShards != 0 && crlShards == 0 {
+			crlShards = issuerConfig.CRLShards
+		}
+		if issuerConfig.CRLShards != crlShards {
+			cmd.Fail(fmt.Sprintf("issuer %d has %d shards, want %d", i, issuerConfig.CRLShards, crlShards))
+		}
 		issuers = append(issuers, issuer)
+		logger.Infof("Loaded issuer: name=[%s] keytype=[%s] nameID=[%v] isActive=[%t]", issuer.Name(), issuer.KeyType(), issuer.NameID(), issuer.IsActive())
 	}
 
-	if c.CA.Issuance.DefaultCertificateProfileName == "" {
-		c.CA.Issuance.DefaultCertificateProfileName = "defaultBoulderCertificateProfile"
-	}
-	logger.Infof("Configured default certificate profile name set to: %s", c.CA.Issuance.DefaultCertificateProfileName)
-
-	// TODO(#7414) Remove this check.
-	if !reflect.ValueOf(c.CA.Issuance.Profile).IsZero() && len(c.CA.Issuance.CertProfiles) > 0 {
-		cmd.Fail("Only one of Issuance.Profile or Issuance.CertProfiles can be configured")
-	}
-
-	// TODO(#7414) Remove this check.
-	// Use the deprecated Profile as a CertProfiles
 	if len(c.CA.Issuance.CertProfiles) == 0 {
-		c.CA.Issuance.CertProfiles = make(map[string]issuance.ProfileConfig, 0)
-		c.CA.Issuance.CertProfiles[c.CA.Issuance.DefaultCertificateProfileName] = c.CA.Issuance.Profile
-	}
-
-	lints, err := linter.NewRegistry(c.CA.Issuance.IgnoredLints)
-	cmd.FailOnError(err, "Failed to create zlint registry")
-	if c.CA.Issuance.LintConfig != "" {
-		lintconfig, err := lint.NewConfigFromFile(c.CA.Issuance.LintConfig)
-		cmd.FailOnError(err, "Failed to load zlint config file")
-		lints.SetConfiguration(lintconfig)
+		cmd.Fail("At least one profile must be configured")
 	}
 
 	tlsConfig, err := c.CA.TLS.Load(scope)
 	cmd.FailOnError(err, "TLS config")
 
-	clk := cmd.Clock()
-
-	conn, err := bgrpc.ClientSetup(c.CA.SAService, tlsConfig, scope, clk)
+	saConn, err := bgrpc.ClientSetup(c.CA.SAService, tlsConfig, scope, clk)
 	cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to SA")
-	sa := sapb.NewStorageAuthorityClient(conn)
+	sa := sapb.NewStorageAuthorityClient(saConn)
+
+	var sctService rapb.SCTProviderClient
+	if c.CA.SCTService != nil {
+		sctConn, err := bgrpc.ClientSetup(c.CA.SCTService, tlsConfig, scope, clk)
+		cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to RA for SCTs")
+		sctService = rapb.NewSCTProviderClient(sctConn)
+	}
 
 	kp, err := sagoodkey.NewPolicy(&c.CA.GoodKey, sa.KeyBlocked)
 	cmd.FailOnError(err, "Unable to create key policy")
-
-	var ecdsaAllowList *ca.ECDSAAllowList
-	var entries int
-	if c.CA.ECDSAAllowListFilename != "" {
-		// Create an allow list object.
-		ecdsaAllowList, entries, err = ca.NewECDSAAllowListFromFile(c.CA.ECDSAAllowListFilename)
-		cmd.FailOnError(err, "Unable to load ECDSA allow list from YAML file")
-		logger.Infof("Loaded an ECDSA allow list with %d entries", entries)
-	}
 
 	srv := bgrpc.NewServer(c.CA.GRPCCA, logger)
 
@@ -281,15 +257,11 @@ func main() {
 	if !c.CA.DisableCertService {
 		cai, err := ca.NewCertificateAuthorityImpl(
 			sa,
+			sctService,
 			pa,
 			issuers,
-			c.CA.Issuance.DefaultCertificateProfileName,
 			c.CA.Issuance.CertProfiles,
-			lints,
-			ecdsaAllowList,
-			c.CA.Expiry.Duration,
-			c.CA.Backdate.Duration,
-			c.CA.SerialPrefix,
+			serialPrefix,
 			c.CA.MaxNames,
 			kp,
 			logger,

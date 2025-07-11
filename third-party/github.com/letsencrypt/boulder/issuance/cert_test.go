@@ -9,14 +9,17 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/asn1"
 	"encoding/base64"
+	"net"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	ct "github.com/google/certificate-transparency-go"
 	"github.com/jmhodges/clock"
 
+	"github.com/letsencrypt/boulder/config"
 	"github.com/letsencrypt/boulder/ctpolicy/loglist"
 	"github.com/letsencrypt/boulder/linter"
 	"github.com/letsencrypt/boulder/test"
@@ -27,12 +30,57 @@ var (
 )
 
 func defaultProfile() *Profile {
-	lints, _ := linter.NewRegistry([]string{
-		"w_ct_sct_policy_count_unsatisfied",
-		"e_scts_from_same_operator",
-	})
-	p, _ := NewProfile(defaultProfileConfig(), lints)
+	p, _ := NewProfile(defaultProfileConfig())
 	return p
+}
+
+func TestGenerateValidity(t *testing.T) {
+	fc := clock.NewFake()
+	fc.Set(time.Date(2015, time.June, 04, 11, 04, 38, 0, time.UTC))
+
+	tests := []struct {
+		name      string
+		backdate  time.Duration
+		validity  time.Duration
+		notBefore time.Time
+		notAfter  time.Time
+	}{
+		{
+			name:      "normal usage",
+			backdate:  time.Hour, // 90% of one hour is 54 minutes
+			validity:  7 * 24 * time.Hour,
+			notBefore: time.Date(2015, time.June, 04, 10, 10, 38, 0, time.UTC),
+			notAfter:  time.Date(2015, time.June, 11, 10, 10, 37, 0, time.UTC),
+		},
+		{
+			name:      "zero backdate",
+			backdate:  0,
+			validity:  7 * 24 * time.Hour,
+			notBefore: time.Date(2015, time.June, 04, 11, 04, 38, 0, time.UTC),
+			notAfter:  time.Date(2015, time.June, 11, 11, 04, 37, 0, time.UTC),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p := Profile{maxBackdate: tc.backdate, maxValidity: tc.validity}
+			notBefore, notAfter := p.GenerateValidity(fc.Now())
+			test.AssertEquals(t, notBefore, tc.notBefore)
+			test.AssertEquals(t, notAfter, tc.notAfter)
+		})
+	}
+}
+
+func TestCRLURL(t *testing.T) {
+	issuer, err := newIssuer(defaultIssuerConfig(), issuerCert, issuerSigner, clock.NewFake())
+	if err != nil {
+		t.Fatalf("newIssuer: %s", err)
+	}
+	url := issuer.crlURL(4928)
+	want := "http://crl-url.example.org/4928.crl"
+	if url != want {
+		t.Errorf("crlURL(4928)=%s, want %s", url, want)
+	}
 }
 
 func TestRequestValid(t *testing.T) {
@@ -50,21 +98,21 @@ func TestRequestValid(t *testing.T) {
 			name:          "unsupported key type",
 			issuer:        &Issuer{},
 			profile:       &Profile{},
-			request:       &IssuanceRequest{PublicKey: &dsa.PublicKey{}},
+			request:       &IssuanceRequest{PublicKey: MarshalablePublicKey{&dsa.PublicKey{}}},
 			expectedError: "unsupported public key type",
 		},
 		{
 			name:          "inactive (rsa)",
 			issuer:        &Issuer{},
 			profile:       &Profile{},
-			request:       &IssuanceRequest{PublicKey: &rsa.PublicKey{}},
+			request:       &IssuanceRequest{PublicKey: MarshalablePublicKey{&rsa.PublicKey{}}},
 			expectedError: "inactive issuer cannot issue precert",
 		},
 		{
 			name:          "inactive (ecdsa)",
 			issuer:        &Issuer{},
 			profile:       &Profile{},
-			request:       &IssuanceRequest{PublicKey: &ecdsa.PublicKey{}},
+			request:       &IssuanceRequest{PublicKey: MarshalablePublicKey{&ecdsa.PublicKey{}}},
 			expectedError: "inactive issuer cannot issue precert",
 		},
 		{
@@ -74,79 +122,24 @@ func TestRequestValid(t *testing.T) {
 			},
 			profile: &Profile{},
 			request: &IssuanceRequest{
-				PublicKey:    &ecdsa.PublicKey{},
+				PublicKey:    MarshalablePublicKey{&ecdsa.PublicKey{}},
 				SubjectKeyId: []byte{0, 1, 2, 3, 4},
 			},
 			expectedError: "unexpected subject key ID length",
 		},
 		{
-			name: "must staple not allowed",
+			name: "both sct list and ct poison provided",
 			issuer: &Issuer{
 				active: true,
 			},
 			profile: &Profile{},
 			request: &IssuanceRequest{
-				PublicKey:         &ecdsa.PublicKey{},
-				SubjectKeyId:      goodSKID,
-				IncludeMustStaple: true,
-			},
-			expectedError: "must-staple extension cannot be included",
-		},
-		{
-			name: "ct poison not allowed",
-			issuer: &Issuer{
-				active: true,
-			},
-			profile: &Profile{},
-			request: &IssuanceRequest{
-				PublicKey:       &ecdsa.PublicKey{},
-				SubjectKeyId:    goodSKID,
-				IncludeCTPoison: true,
-			},
-			expectedError: "ct poison extension cannot be included",
-		},
-		{
-			name: "sct list not allowed",
-			issuer: &Issuer{
-				active: true,
-			},
-			profile: &Profile{},
-			request: &IssuanceRequest{
-				PublicKey:    &ecdsa.PublicKey{},
-				SubjectKeyId: goodSKID,
-				sctList:      []ct.SignedCertificateTimestamp{},
-			},
-			expectedError: "sct list extension cannot be included",
-		},
-		{
-			name: "sct list and ct poison not allowed",
-			issuer: &Issuer{
-				active: true,
-			},
-			profile: &Profile{
-				allowCTPoison: true,
-				allowSCTList:  true,
-			},
-			request: &IssuanceRequest{
-				PublicKey:       &ecdsa.PublicKey{},
+				PublicKey:       MarshalablePublicKey{&ecdsa.PublicKey{}},
 				SubjectKeyId:    goodSKID,
 				IncludeCTPoison: true,
 				sctList:         []ct.SignedCertificateTimestamp{},
 			},
 			expectedError: "cannot include both ct poison and sct list extensions",
-		},
-		{
-			name: "common name not allowed",
-			issuer: &Issuer{
-				active: true,
-			},
-			profile: &Profile{},
-			request: &IssuanceRequest{
-				PublicKey:    &ecdsa.PublicKey{},
-				SubjectKeyId: goodSKID,
-				CommonName:   "cn",
-			},
-			expectedError: "common name cannot be included",
 		},
 		{
 			name: "negative validity",
@@ -155,7 +148,7 @@ func TestRequestValid(t *testing.T) {
 			},
 			profile: &Profile{},
 			request: &IssuanceRequest{
-				PublicKey:    &ecdsa.PublicKey{},
+				PublicKey:    MarshalablePublicKey{&ecdsa.PublicKey{}},
 				SubjectKeyId: goodSKID,
 				NotBefore:    fc.Now().Add(time.Hour),
 				NotAfter:     fc.Now(),
@@ -171,7 +164,7 @@ func TestRequestValid(t *testing.T) {
 				maxValidity: time.Minute,
 			},
 			request: &IssuanceRequest{
-				PublicKey:    &ecdsa.PublicKey{},
+				PublicKey:    MarshalablePublicKey{&ecdsa.PublicKey{}},
 				SubjectKeyId: goodSKID,
 				NotBefore:    fc.Now(),
 				NotAfter:     fc.Now().Add(time.Hour - time.Second),
@@ -187,7 +180,7 @@ func TestRequestValid(t *testing.T) {
 				maxValidity: time.Hour,
 			},
 			request: &IssuanceRequest{
-				PublicKey:    &ecdsa.PublicKey{},
+				PublicKey:    MarshalablePublicKey{&ecdsa.PublicKey{}},
 				SubjectKeyId: goodSKID,
 				NotBefore:    fc.Now(),
 				NotAfter:     fc.Now().Add(time.Hour),
@@ -204,7 +197,7 @@ func TestRequestValid(t *testing.T) {
 				maxBackdate: time.Hour,
 			},
 			request: &IssuanceRequest{
-				PublicKey:    &ecdsa.PublicKey{},
+				PublicKey:    MarshalablePublicKey{&ecdsa.PublicKey{}},
 				SubjectKeyId: goodSKID,
 				NotBefore:    fc.Now().Add(-time.Hour * 2),
 				NotAfter:     fc.Now().Add(-time.Hour),
@@ -221,7 +214,7 @@ func TestRequestValid(t *testing.T) {
 				maxBackdate: time.Hour,
 			},
 			request: &IssuanceRequest{
-				PublicKey:    &ecdsa.PublicKey{},
+				PublicKey:    MarshalablePublicKey{&ecdsa.PublicKey{}},
 				SubjectKeyId: goodSKID,
 				NotBefore:    fc.Now().Add(time.Hour),
 				NotAfter:     fc.Now().Add(time.Hour * 2),
@@ -237,7 +230,7 @@ func TestRequestValid(t *testing.T) {
 				maxValidity: time.Hour * 2,
 			},
 			request: &IssuanceRequest{
-				PublicKey:    &ecdsa.PublicKey{},
+				PublicKey:    MarshalablePublicKey{&ecdsa.PublicKey{}},
 				SubjectKeyId: goodSKID,
 				NotBefore:    fc.Now(),
 				NotAfter:     fc.Now().Add(time.Hour),
@@ -254,7 +247,7 @@ func TestRequestValid(t *testing.T) {
 				maxValidity: time.Hour * 2,
 			},
 			request: &IssuanceRequest{
-				PublicKey:    &ecdsa.PublicKey{},
+				PublicKey:    MarshalablePublicKey{&ecdsa.PublicKey{}},
 				SubjectKeyId: goodSKID,
 				NotBefore:    fc.Now(),
 				NotAfter:     fc.Now().Add(time.Hour),
@@ -263,7 +256,7 @@ func TestRequestValid(t *testing.T) {
 			expectedError: "serial must be between 9 and 19 bytes",
 		},
 		{
-			name: "good",
+			name: "good with poison",
 			issuer: &Issuer{
 				active: true,
 			},
@@ -271,11 +264,29 @@ func TestRequestValid(t *testing.T) {
 				maxValidity: time.Hour * 2,
 			},
 			request: &IssuanceRequest{
-				PublicKey:    &ecdsa.PublicKey{},
+				PublicKey:       MarshalablePublicKey{&ecdsa.PublicKey{}},
+				SubjectKeyId:    goodSKID,
+				NotBefore:       fc.Now(),
+				NotAfter:        fc.Now().Add(time.Hour),
+				Serial:          []byte{1, 2, 3, 4, 5, 6, 7, 8, 9},
+				IncludeCTPoison: true,
+			},
+		},
+		{
+			name: "good with scts",
+			issuer: &Issuer{
+				active: true,
+			},
+			profile: &Profile{
+				maxValidity: time.Hour * 2,
+			},
+			request: &IssuanceRequest{
+				PublicKey:    MarshalablePublicKey{&ecdsa.PublicKey{}},
 				SubjectKeyId: goodSKID,
 				NotBefore:    fc.Now(),
 				NotAfter:     fc.Now().Add(time.Hour),
 				Serial:       []byte{1, 2, 3, 4, 5, 6, 7, 8, 9},
+				sctList:      []ct.SignedCertificateTimestamp{},
 			},
 		},
 	}
@@ -298,7 +309,6 @@ func TestRequestValid(t *testing.T) {
 
 func TestGenerateTemplate(t *testing.T) {
 	issuer := &Issuer{
-		ocspURL:    "http://ocsp",
 		issuerURL:  "http://issuer",
 		crlURLBase: "http://crl/",
 		sigAlg:     x509.SHA256WithRSA,
@@ -309,14 +319,11 @@ func TestGenerateTemplate(t *testing.T) {
 	expected := &x509.Certificate{
 		BasicConstraintsValid: true,
 		SignatureAlgorithm:    x509.SHA256WithRSA,
-		ExtKeyUsage: []x509.ExtKeyUsage{
-			x509.ExtKeyUsageServerAuth,
-			x509.ExtKeyUsageClientAuth,
-		},
 		IssuingCertificateURL: []string{"http://issuer"},
-		OCSPServer:            []string{"http://ocsp"},
+		Policies:              []x509.OID{domainValidatedOID},
+		// These fields are only included if specified in the profile.
+		OCSPServer:            nil,
 		CRLDistributionPoints: nil,
-		PolicyIdentifiers:     []asn1.ObjectIdentifier{{2, 23, 140, 1, 2, 1}},
 	}
 
 	test.AssertDeepEquals(t, actual, expected)
@@ -351,10 +358,11 @@ func TestIssue(t *testing.T) {
 			pk, err := tc.generateFunc()
 			test.AssertNotError(t, err, "failed to generate test key")
 			lintCertBytes, issuanceToken, err := signer.Prepare(defaultProfile(), &IssuanceRequest{
-				PublicKey:       pk.Public(),
+				PublicKey:       MarshalablePublicKey{pk.Public()},
 				SubjectKeyId:    goodSKID,
 				Serial:          []byte{1, 2, 3, 4, 5, 6, 7, 8, 9},
 				DNSNames:        []string{"example.com"},
+				IPAddresses:     []net.IP{net.ParseIP("128.101.101.101"), net.ParseIP("3fff:aaa:a:c0ff:ee:a:bad:deed")},
 				NotBefore:       fc.Now(),
 				NotAfter:        fc.Now().Add(time.Hour - time.Second),
 				IncludeCTPoison: true,
@@ -369,11 +377,142 @@ func TestIssue(t *testing.T) {
 			err = cert.CheckSignatureFrom(issuerCert.Certificate)
 			test.AssertNotError(t, err, "signature validation failed")
 			test.AssertDeepEquals(t, cert.DNSNames, []string{"example.com"})
+			// net.ParseIP always returns a 16-byte address; IPv4 addresses are
+			// returned in IPv4-mapped IPv6 form. But RFC 5280, Sec. 4.2.1.6
+			// requires that IPv4 addresses be encoded as 4 bytes.
+			//
+			// The issuance pipeline calls x509.marshalSANs, which reduces IPv4
+			// addresses back to 4 bytes. Adding .To4() both allows this test to
+			// succeed, and covers this requirement.
+			test.AssertDeepEquals(t, cert.IPAddresses, []net.IP{net.ParseIP("128.101.101.101").To4(), net.ParseIP("3fff:aaa:a:c0ff:ee:a:bad:deed")})
 			test.AssertByteEquals(t, cert.SerialNumber.Bytes(), []byte{1, 2, 3, 4, 5, 6, 7, 8, 9})
 			test.AssertDeepEquals(t, cert.PublicKey, pk.Public())
-			test.AssertEquals(t, len(cert.Extensions), 9) // Constraints, KU, EKU, SKID, AKID, AIA, SAN, Policies, Poison
+			test.AssertEquals(t, len(cert.Extensions), 10) // Constraints, KU, EKU, SKID, AKID, AIA, CRLDP, SAN, Policies, Poison
 			test.AssertEquals(t, cert.KeyUsage, tc.ku)
+			if len(cert.CRLDistributionPoints) != 1 || !strings.HasPrefix(cert.CRLDistributionPoints[0], "http://crl-url.example.org/") {
+				t.Errorf("want CRLDistributionPoints=[http://crl-url.example.org/x.crl], got %v", cert.CRLDistributionPoints)
+			}
 		})
+	}
+}
+
+func TestIssueDNSNamesOnly(t *testing.T) {
+	fc := clock.NewFake()
+	signer, err := newIssuer(defaultIssuerConfig(), issuerCert, issuerSigner, fc)
+	if err != nil {
+		t.Fatalf("newIssuer: %s", err)
+	}
+	pk, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("ecdsa.GenerateKey: %s", err)
+	}
+	_, issuanceToken, err := signer.Prepare(defaultProfile(), &IssuanceRequest{
+		PublicKey:       MarshalablePublicKey{pk.Public()},
+		SubjectKeyId:    goodSKID,
+		Serial:          []byte{1, 2, 3, 4, 5, 6, 7, 8, 9},
+		DNSNames:        []string{"example.com"},
+		NotBefore:       fc.Now(),
+		NotAfter:        fc.Now().Add(time.Hour - time.Second),
+		IncludeCTPoison: true,
+	})
+	if err != nil {
+		t.Fatalf("signer.Prepare: %s", err)
+	}
+	certBytes, err := signer.Issue(issuanceToken)
+	if err != nil {
+		t.Fatalf("signer.Issue: %s", err)
+	}
+	cert, err := x509.ParseCertificate(certBytes)
+	if err != nil {
+		t.Fatalf("x509.ParseCertificate: %s", err)
+	}
+	if !reflect.DeepEqual(cert.DNSNames, []string{"example.com"}) {
+		t.Errorf("got DNSNames %s, wanted example.com", cert.DNSNames)
+	}
+	// BRs 7.1.2.7.12 requires iPAddress, if present, to contain an entry.
+	if cert.IPAddresses != nil {
+		t.Errorf("got IPAddresses %s, wanted nil", cert.IPAddresses)
+	}
+}
+
+func TestIssueIPAddressesOnly(t *testing.T) {
+	fc := clock.NewFake()
+	signer, err := newIssuer(defaultIssuerConfig(), issuerCert, issuerSigner, fc)
+	if err != nil {
+		t.Fatalf("newIssuer: %s", err)
+	}
+	pk, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("ecdsa.GenerateKey: %s", err)
+	}
+	_, issuanceToken, err := signer.Prepare(defaultProfile(), &IssuanceRequest{
+		PublicKey:       MarshalablePublicKey{pk.Public()},
+		SubjectKeyId:    goodSKID,
+		Serial:          []byte{1, 2, 3, 4, 5, 6, 7, 8, 9},
+		IPAddresses:     []net.IP{net.ParseIP("128.101.101.101"), net.ParseIP("3fff:aaa:a:c0ff:ee:a:bad:deed")},
+		NotBefore:       fc.Now(),
+		NotAfter:        fc.Now().Add(time.Hour - time.Second),
+		IncludeCTPoison: true,
+	})
+	if err != nil {
+		t.Fatalf("signer.Prepare: %s", err)
+	}
+	certBytes, err := signer.Issue(issuanceToken)
+	if err != nil {
+		t.Fatalf("signer.Issue: %s", err)
+	}
+	cert, err := x509.ParseCertificate(certBytes)
+	if err != nil {
+		t.Fatalf("x509.ParseCertificate: %s", err)
+	}
+	// BRs 7.1.2.7.12 requires dNSName, if present, to contain an entry.
+	if cert.DNSNames != nil {
+		t.Errorf("got DNSNames %s, wanted nil", cert.DNSNames)
+	}
+	if !reflect.DeepEqual(cert.IPAddresses, []net.IP{net.ParseIP("128.101.101.101").To4(), net.ParseIP("3fff:aaa:a:c0ff:ee:a:bad:deed")}) {
+		t.Errorf("got IPAddresses %s, wanted 128.101.101.101 (4-byte) & 3fff:aaa:a:c0ff:ee:a:bad:deed (16-byte)", cert.IPAddresses)
+	}
+}
+
+func TestIssueWithCRLDP(t *testing.T) {
+	fc := clock.NewFake()
+	issuerConfig := defaultIssuerConfig()
+	issuerConfig.CRLURLBase = "http://crls.example.net/"
+	issuerConfig.CRLShards = 999
+	signer, err := newIssuer(issuerConfig, issuerCert, issuerSigner, fc)
+	if err != nil {
+		t.Fatalf("newIssuer: %s", err)
+	}
+	pk, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("ecdsa.GenerateKey: %s", err)
+	}
+	profile := defaultProfile()
+	profile.includeCRLDistributionPoints = true
+	_, issuanceToken, err := signer.Prepare(profile, &IssuanceRequest{
+		PublicKey:       MarshalablePublicKey{pk.Public()},
+		SubjectKeyId:    goodSKID,
+		Serial:          []byte{1, 2, 3, 4, 5, 6, 7, 8, 9},
+		DNSNames:        []string{"example.com"},
+		NotBefore:       fc.Now(),
+		NotAfter:        fc.Now().Add(time.Hour - time.Second),
+		IncludeCTPoison: true,
+	})
+	if err != nil {
+		t.Fatalf("signer.Prepare: %s", err)
+	}
+	certBytes, err := signer.Issue(issuanceToken)
+	if err != nil {
+		t.Fatalf("signer.Issue: %s", err)
+	}
+	cert, err := x509.ParseCertificate(certBytes)
+	if err != nil {
+		t.Fatalf("x509.ParseCertificate: %s", err)
+	}
+	// Because CRL shard is calculated deterministically from serial, we know which shard will be chosen.
+	expectedCRLDP := []string{"http://crls.example.net/919.crl"}
+	if !reflect.DeepEqual(cert.CRLDistributionPoints, expectedCRLDP) {
+		t.Errorf("CRLDP=%+v, want %+v", cert.CRLDistributionPoints, expectedCRLDP)
 	}
 }
 
@@ -381,29 +520,26 @@ func TestIssueCommonName(t *testing.T) {
 	fc := clock.NewFake()
 	fc.Set(time.Now())
 
-	lints, err := linter.NewRegistry([]string{
-		"w_subject_common_name_included",
-		"w_ct_sct_policy_count_unsatisfied",
-		"e_scts_from_same_operator",
-	})
-	test.AssertNotError(t, err, "building test lint registry")
-	cnProfile, err := NewProfile(defaultProfileConfig(), lints)
+	prof := defaultProfileConfig()
+	prof.IgnoredLints = append(prof.IgnoredLints, "w_subject_common_name_included")
+	cnProfile, err := NewProfile(prof)
 	test.AssertNotError(t, err, "NewProfile failed")
 	signer, err := newIssuer(defaultIssuerConfig(), issuerCert, issuerSigner, fc)
 	test.AssertNotError(t, err, "NewIssuer failed")
 	pk, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	test.AssertNotError(t, err, "failed to generate test key")
 	ir := &IssuanceRequest{
-		PublicKey:       pk.Public(),
+		PublicKey:       MarshalablePublicKey{pk.Public()},
 		SubjectKeyId:    goodSKID,
 		Serial:          []byte{1, 2, 3, 4, 5, 6, 7, 8, 9},
-		CommonName:      "example.com",
 		DNSNames:        []string{"example.com", "www.example.com"},
 		NotBefore:       fc.Now(),
 		NotAfter:        fc.Now().Add(time.Hour - time.Second),
 		IncludeCTPoison: true,
 	}
 
+	// In the default profile, the common name is allowed if requested.
+	ir.CommonName = "example.com"
 	_, issuanceToken, err := signer.Prepare(cnProfile, ir)
 	test.AssertNotError(t, err, "Prepare failed")
 	certBytes, err := signer.Issue(issuanceToken)
@@ -412,10 +548,7 @@ func TestIssueCommonName(t *testing.T) {
 	test.AssertNotError(t, err, "failed to parse certificate")
 	test.AssertEquals(t, cert.Subject.CommonName, "example.com")
 
-	cnProfile.allowCommonName = false
-	_, _, err = signer.Prepare(cnProfile, ir)
-	test.AssertError(t, err, "Prepare should have failed")
-
+	// But not including the common name should be acceptable as well.
 	ir.CommonName = ""
 	_, issuanceToken, err = signer.Prepare(cnProfile, ir)
 	test.AssertNotError(t, err, "Prepare failed")
@@ -424,7 +557,64 @@ func TestIssueCommonName(t *testing.T) {
 	cert, err = x509.ParseCertificate(certBytes)
 	test.AssertNotError(t, err, "failed to parse certificate")
 	test.AssertEquals(t, cert.Subject.CommonName, "")
-	test.AssertDeepEquals(t, cert.DNSNames, []string{"example.com", "www.example.com"})
+
+	// And the common name should be omitted if the profile is so configured.
+	ir.CommonName = "example.com"
+	cnProfile.omitCommonName = true
+	_, issuanceToken, err = signer.Prepare(cnProfile, ir)
+	test.AssertNotError(t, err, "Prepare failed")
+	certBytes, err = signer.Issue(issuanceToken)
+	test.AssertNotError(t, err, "Issue failed")
+	cert, err = x509.ParseCertificate(certBytes)
+	test.AssertNotError(t, err, "failed to parse certificate")
+	test.AssertEquals(t, cert.Subject.CommonName, "")
+}
+
+func TestIssueOmissions(t *testing.T) {
+	fc := clock.NewFake()
+	fc.Set(time.Now())
+
+	pc := defaultProfileConfig()
+	pc.OmitCommonName = true
+	pc.OmitKeyEncipherment = true
+	pc.OmitClientAuth = true
+	pc.OmitSKID = true
+	pc.IgnoredLints = []string{
+		// Reduce the lint ignores to just the minimal (SCT-related) set.
+		"w_ct_sct_policy_count_unsatisfied",
+		"e_scts_from_same_operator",
+		// Ignore the warning about *not* including the SubjectKeyIdentifier extension:
+		// zlint has both lints (one enforcing RFC5280, the other the BRs).
+		"w_ext_subject_key_identifier_missing_sub_cert",
+	}
+	prof, err := NewProfile(pc)
+	test.AssertNotError(t, err, "building test profile")
+
+	signer, err := newIssuer(defaultIssuerConfig(), issuerCert, issuerSigner, fc)
+	test.AssertNotError(t, err, "NewIssuer failed")
+
+	pk, err := rsa.GenerateKey(rand.Reader, 2048)
+	test.AssertNotError(t, err, "failed to generate test key")
+	_, issuanceToken, err := signer.Prepare(prof, &IssuanceRequest{
+		PublicKey:       MarshalablePublicKey{pk.Public()},
+		SubjectKeyId:    goodSKID,
+		Serial:          []byte{1, 2, 3, 4, 5, 6, 7, 8, 9},
+		DNSNames:        []string{"example.com"},
+		CommonName:      "example.com",
+		IncludeCTPoison: true,
+		NotBefore:       fc.Now(),
+		NotAfter:        fc.Now().Add(time.Hour - time.Second),
+	})
+	test.AssertNotError(t, err, "Prepare failed")
+	certBytes, err := signer.Issue(issuanceToken)
+	test.AssertNotError(t, err, "Issue failed")
+	cert, err := x509.ParseCertificate(certBytes)
+	test.AssertNotError(t, err, "failed to parse certificate")
+
+	test.AssertEquals(t, cert.Subject.CommonName, "")
+	test.AssertEquals(t, cert.KeyUsage, x509.KeyUsageDigitalSignature)
+	test.AssertDeepEquals(t, cert.ExtKeyUsage, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth})
+	test.AssertEquals(t, len(cert.SubjectKeyId), 0)
 }
 
 func TestIssueCTPoison(t *testing.T) {
@@ -432,11 +622,10 @@ func TestIssueCTPoison(t *testing.T) {
 	fc.Set(time.Now())
 	signer, err := newIssuer(defaultIssuerConfig(), issuerCert, issuerSigner, fc)
 	test.AssertNotError(t, err, "NewIssuer failed")
-	test.AssertNotError(t, err, "NewIssuer failed")
 	pk, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	test.AssertNotError(t, err, "failed to generate test key")
 	_, issuanceToken, err := signer.Prepare(defaultProfile(), &IssuanceRequest{
-		PublicKey:       pk.Public(),
+		PublicKey:       MarshalablePublicKey{pk.Public()},
 		SubjectKeyId:    goodSKID,
 		Serial:          []byte{1, 2, 3, 4, 5, 6, 7, 8, 9},
 		DNSNames:        []string{"example.com"},
@@ -453,8 +642,8 @@ func TestIssueCTPoison(t *testing.T) {
 	test.AssertNotError(t, err, "signature validation failed")
 	test.AssertByteEquals(t, cert.SerialNumber.Bytes(), []byte{1, 2, 3, 4, 5, 6, 7, 8, 9})
 	test.AssertDeepEquals(t, cert.PublicKey, pk.Public())
-	test.AssertEquals(t, len(cert.Extensions), 9) // Constraints, KU, EKU, SKID, AKID, AIA, SAN, Policies, CT Poison
-	test.AssertDeepEquals(t, cert.Extensions[8], ctPoisonExt)
+	test.AssertEquals(t, len(cert.Extensions), 10) // Constraints, KU, EKU, SKID, AKID, AIA, CRLDP, SAN, Policies, Poison
+	test.AssertDeepEquals(t, cert.Extensions[9], ctPoisonExt)
 }
 
 func mustDecodeB64(b string) []byte {
@@ -472,16 +661,19 @@ func TestIssueSCTList(t *testing.T) {
 	err := loglist.InitLintList("../test/ct-test-srv/log_list.json")
 	test.AssertNotError(t, err, "failed to load log list")
 
-	lints, err := linter.NewRegistry([]string{})
-	test.AssertNotError(t, err, "building test lint registry")
-	enforceSCTsProfile, err := NewProfile(defaultProfileConfig(), lints)
+	pc := defaultProfileConfig()
+	pc.IgnoredLints = []string{
+		// Only ignore the SKID lint, i.e., don't ignore the "missing SCT" lints.
+		"w_ext_subject_key_identifier_not_recommended_subscriber",
+	}
+	enforceSCTsProfile, err := NewProfile(pc)
 	test.AssertNotError(t, err, "NewProfile failed")
 	signer, err := newIssuer(defaultIssuerConfig(), issuerCert, issuerSigner, fc)
 	test.AssertNotError(t, err, "NewIssuer failed")
 	pk, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	test.AssertNotError(t, err, "failed to generate test key")
 	_, issuanceToken, err := signer.Prepare(enforceSCTsProfile, &IssuanceRequest{
-		PublicKey:       pk.Public(),
+		PublicKey:       MarshalablePublicKey{pk.Public()},
 		SubjectKeyId:    goodSKID,
 		Serial:          []byte{1, 2, 3, 4, 5, 6, 7, 8, 9},
 		DNSNames:        []string{"example.com"},
@@ -522,8 +714,8 @@ func TestIssueSCTList(t *testing.T) {
 	test.AssertNotError(t, err, "signature validation failed")
 	test.AssertByteEquals(t, finalCert.SerialNumber.Bytes(), []byte{1, 2, 3, 4, 5, 6, 7, 8, 9})
 	test.AssertDeepEquals(t, finalCert.PublicKey, pk.Public())
-	test.AssertEquals(t, len(finalCert.Extensions), 9) // Constraints, KU, EKU, SKID, AKID, AIA, SAN, Policies, SCT list
-	test.AssertDeepEquals(t, finalCert.Extensions[8], pkix.Extension{
+	test.AssertEquals(t, len(finalCert.Extensions), 10) // Constraints, KU, EKU, SKID, AKID, AIA, CRLDP, SAN, Policies, Poison
+	test.AssertDeepEquals(t, finalCert.Extensions[9], pkix.Extension{
 		Id: sctListOID,
 		Value: []byte{
 			4, 100, 0, 98, 0, 47, 0, 56, 152, 140, 148, 208, 53, 152, 195, 147, 45,
@@ -536,51 +728,20 @@ func TestIssueSCTList(t *testing.T) {
 	})
 }
 
-func TestIssueMustStaple(t *testing.T) {
-	fc := clock.NewFake()
-	fc.Set(time.Now())
-
-	signer, err := newIssuer(defaultIssuerConfig(), issuerCert, issuerSigner, fc)
-	test.AssertNotError(t, err, "NewIssuer failed")
-	pk, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	test.AssertNotError(t, err, "failed to generate test key")
-	_, issuanceToken, err := signer.Prepare(defaultProfile(), &IssuanceRequest{
-		PublicKey:         pk.Public(),
-		SubjectKeyId:      goodSKID,
-		Serial:            []byte{1, 2, 3, 4, 5, 6, 7, 8, 9},
-		DNSNames:          []string{"example.com"},
-		IncludeMustStaple: true,
-		NotBefore:         fc.Now(),
-		NotAfter:          fc.Now().Add(time.Hour - time.Second),
-		IncludeCTPoison:   true,
-	})
-	test.AssertNotError(t, err, "Prepare failed")
-	certBytes, err := signer.Issue(issuanceToken)
-	test.AssertNotError(t, err, "Issue failed")
-	cert, err := x509.ParseCertificate(certBytes)
-	test.AssertNotError(t, err, "failed to parse certificate")
-	err = cert.CheckSignatureFrom(issuerCert.Certificate)
-	test.AssertNotError(t, err, "signature validation failed")
-	test.AssertByteEquals(t, cert.SerialNumber.Bytes(), []byte{1, 2, 3, 4, 5, 6, 7, 8, 9})
-	test.AssertDeepEquals(t, cert.PublicKey, pk.Public())
-	test.AssertEquals(t, len(cert.Extensions), 10) // Constraints, KU, EKU, SKID, AKID, AIA, SAN, Policies, Must-Staple, Poison
-	test.AssertDeepEquals(t, cert.Extensions[9], mustStapleExt)
-}
-
 func TestIssueBadLint(t *testing.T) {
 	fc := clock.NewFake()
 	fc.Set(time.Now())
 
-	lints, err := linter.NewRegistry([]string{})
-	test.AssertNotError(t, err, "building test lint registry")
-	noSkipLintsProfile, err := NewProfile(defaultProfileConfig(), lints)
+	pc := defaultProfileConfig()
+	pc.IgnoredLints = []string{}
+	noSkipLintsProfile, err := NewProfile(pc)
 	test.AssertNotError(t, err, "NewProfile failed")
 	signer, err := newIssuer(defaultIssuerConfig(), issuerCert, issuerSigner, fc)
 	test.AssertNotError(t, err, "NewIssuer failed")
 	pk, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	test.AssertNotError(t, err, "failed to generate test key")
 	_, _, err = signer.Prepare(noSkipLintsProfile, &IssuanceRequest{
-		PublicKey:       pk.Public(),
+		PublicKey:       MarshalablePublicKey{pk.Public()},
 		SubjectKeyId:    goodSKID,
 		Serial:          []byte{1, 2, 3, 4, 5, 6, 7, 8, 9},
 		DNSNames:        []string{"example-com"},
@@ -609,7 +770,7 @@ func TestIssuanceToken(t *testing.T) {
 	pk, err := rsa.GenerateKey(rand.Reader, 2048)
 	test.AssertNotError(t, err, "failed to generate test key")
 	_, issuanceToken, err := signer.Prepare(defaultProfile(), &IssuanceRequest{
-		PublicKey:       pk.Public(),
+		PublicKey:       MarshalablePublicKey{pk.Public()},
 		SubjectKeyId:    goodSKID,
 		Serial:          []byte{1, 2, 3, 4, 5, 6, 7, 8, 9},
 		DNSNames:        []string{"example.com"},
@@ -626,7 +787,7 @@ func TestIssuanceToken(t *testing.T) {
 	test.AssertContains(t, err.Error(), "issuance token already redeemed")
 
 	_, issuanceToken, err = signer.Prepare(defaultProfile(), &IssuanceRequest{
-		PublicKey:       pk.Public(),
+		PublicKey:       MarshalablePublicKey{pk.Public()},
 		SubjectKeyId:    goodSKID,
 		Serial:          []byte{1, 2, 3, 4, 5, 6, 7, 8, 9},
 		DNSNames:        []string{"example.com"},
@@ -656,7 +817,7 @@ func TestInvalidProfile(t *testing.T) {
 	pk, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	test.AssertNotError(t, err, "failed to generate test key")
 	_, _, err = signer.Prepare(defaultProfile(), &IssuanceRequest{
-		PublicKey:       pk.Public(),
+		PublicKey:       MarshalablePublicKey{pk.Public()},
 		SubjectKeyId:    goodSKID,
 		Serial:          []byte{1, 2, 3, 4, 5, 6, 7, 8, 9},
 		DNSNames:        []string{"example.com"},
@@ -668,7 +829,7 @@ func TestInvalidProfile(t *testing.T) {
 	test.AssertError(t, err, "Invalid IssuanceRequest")
 
 	_, _, err = signer.Prepare(defaultProfile(), &IssuanceRequest{
-		PublicKey:    pk.Public(),
+		PublicKey:    MarshalablePublicKey{pk.Public()},
 		SubjectKeyId: goodSKID,
 		Serial:       []byte{1, 2, 3, 4, 5, 6, 7, 8, 9},
 		DNSNames:     []string{"example.com"},
@@ -697,19 +858,15 @@ func TestMismatchedProfiles(t *testing.T) {
 	issuer1, err := newIssuer(defaultIssuerConfig(), issuerCert, issuerSigner, fc)
 	test.AssertNotError(t, err, "NewIssuer failed")
 
-	lints, err := linter.NewRegistry([]string{
-		"w_subject_common_name_included",
-		"w_ct_sct_policy_count_unsatisfied",
-		"e_scts_from_same_operator",
-	})
-	test.AssertNotError(t, err, "building test lint registry")
-	cnProfile, err := NewProfile(defaultProfileConfig(), lints)
+	pc := defaultProfileConfig()
+	pc.IgnoredLints = append(pc.IgnoredLints, "w_subject_common_name_included")
+	cnProfile, err := NewProfile(pc)
 	test.AssertNotError(t, err, "NewProfile failed")
 
 	pk, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	test.AssertNotError(t, err, "failed to generate test key")
 	_, issuanceToken, err := issuer1.Prepare(cnProfile, &IssuanceRequest{
-		PublicKey:       pk.Public(),
+		PublicKey:       MarshalablePublicKey{pk.Public()},
 		SubjectKeyId:    goodSKID,
 		Serial:          []byte{1, 2, 3, 4, 5, 6, 7, 8, 9},
 		CommonName:      "example.com",
@@ -724,14 +881,10 @@ func TestMismatchedProfiles(t *testing.T) {
 	test.AssertNotError(t, err, "signing precert")
 
 	// Create a new profile that differs slightly (no common name)
-	profileConfig := defaultProfileConfig()
-	profileConfig.AllowCommonName = false
-	lints, err = linter.NewRegistry([]string{
-		"w_ct_sct_policy_count_unsatisfied",
-		"e_scts_from_same_operator",
-	})
+	pc = defaultProfileConfig()
+	pc.OmitCommonName = false
 	test.AssertNotError(t, err, "building test lint registry")
-	noCNProfile, err := NewProfile(profileConfig, lints)
+	noCNProfile, err := NewProfile(pc)
 	test.AssertNotError(t, err, "NewProfile failed")
 
 	issuer2, err := newIssuer(defaultIssuerConfig(), issuerCert, issuerSigner, fc)
@@ -758,4 +911,62 @@ func TestMismatchedProfiles(t *testing.T) {
 	_, _, err = issuer2.Prepare(noCNProfile, request2)
 	test.AssertError(t, err, "preparing final cert issuance")
 	test.AssertContains(t, err.Error(), "precert does not correspond to linted final cert")
+}
+
+func TestNewProfile(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		config  ProfileConfig
+		wantErr string
+	}{
+		{
+			name: "happy path",
+			config: ProfileConfig{
+				MaxValidityBackdate:          config.Duration{Duration: 1 * time.Hour},
+				MaxValidityPeriod:            config.Duration{Duration: 90 * 24 * time.Hour},
+				IncludeCRLDistributionPoints: true,
+			},
+		},
+		{
+			name: "large backdate",
+			config: ProfileConfig{
+				MaxValidityBackdate: config.Duration{Duration: 24 * time.Hour},
+				MaxValidityPeriod:   config.Duration{Duration: 90 * 24 * time.Hour},
+			},
+			wantErr: "backdate \"24h0m0s\" is too large",
+		},
+		{
+			name: "large validity",
+			config: ProfileConfig{
+				MaxValidityBackdate: config.Duration{Duration: 1 * time.Hour},
+				MaxValidityPeriod:   config.Duration{Duration: 397 * 24 * time.Hour},
+			},
+			wantErr: "validity period \"9528h0m0s\" is too large",
+		},
+		{
+			name: "no revocation info",
+			config: ProfileConfig{
+				MaxValidityBackdate:          config.Duration{Duration: 1 * time.Hour},
+				MaxValidityPeriod:            config.Duration{Duration: 90 * 24 * time.Hour},
+				IncludeCRLDistributionPoints: false,
+			},
+			wantErr: "revocation mechanism must be included",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gotProfile, gotErr := NewProfile(&tc.config)
+			if tc.wantErr != "" {
+				if gotErr == nil {
+					t.Errorf("NewProfile(%#v) = %#v, but want err %q", tc.config, gotProfile, tc.wantErr)
+				}
+				if !strings.Contains(gotErr.Error(), tc.wantErr) {
+					t.Errorf("NewProfile(%#v) = %q, but want %q", tc.config, gotErr, tc.wantErr)
+				}
+			} else {
+				if gotErr != nil {
+					t.Errorf("NewProfile(%#v) = %q, but want no error", tc.config, gotErr)
+				}
+			}
+		})
+	}
 }

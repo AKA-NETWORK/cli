@@ -31,8 +31,6 @@ type Config struct {
 		RAService *cmd.GRPCClientConfig
 		SAService *cmd.GRPCClientConfig
 
-		DebugAddr string
-
 		Features features.Config
 	}
 
@@ -70,9 +68,10 @@ func main() {
 
 	// This is the registry of all subcommands that the admin tool can run.
 	subcommands := map[string]subcommand{
-		"revoke-cert":  &subcommandRevokeCert{},
-		"block-key":    &subcommandBlockKey{},
-		"update-email": &subcommandUpdateEmail{},
+		"revoke-cert":      &subcommandRevokeCert{},
+		"block-key":        &subcommandBlockKey{},
+		"pause-identifier": &subcommandPauseIdentifier{},
+		"unpause-account":  &subcommandUnpauseAccount{},
 	}
 
 	defaultUsage := flag.Usage

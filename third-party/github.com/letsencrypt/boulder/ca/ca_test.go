@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	mrand "math/rand"
 	"os"
 	"strings"
 	"testing"
@@ -22,7 +23,6 @@ import (
 	"github.com/jmhodges/clock"
 	"github.com/miekg/pkcs11"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/zmap/zlint/v3/lint"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/emptypb"
 
@@ -33,12 +33,13 @@ import (
 	berrors "github.com/letsencrypt/boulder/errors"
 	"github.com/letsencrypt/boulder/features"
 	"github.com/letsencrypt/boulder/goodkey"
+	"github.com/letsencrypt/boulder/identifier"
 	"github.com/letsencrypt/boulder/issuance"
-	"github.com/letsencrypt/boulder/linter"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/metrics"
 	"github.com/letsencrypt/boulder/must"
 	"github.com/letsencrypt/boulder/policy"
+	rapb "github.com/letsencrypt/boulder/ra/proto"
 	sapb "github.com/letsencrypt/boulder/sa/proto"
 	"github.com/letsencrypt/boulder/test"
 )
@@ -93,28 +94,22 @@ var (
 	OIDExtensionSCTList = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 11129, 2, 4, 2}
 )
 
-const arbitraryRegID int64 = 1001
-
 func mustRead(path string) []byte {
 	return must.Do(os.ReadFile(path))
 }
 
 type testCtx struct {
-	pa                     core.PolicyAuthority
-	ocsp                   *ocspImpl
-	crl                    *crlImpl
-	defaultCertProfileName string
-	lints                  lint.Registry
-	certProfiles           map[string]issuance.ProfileConfig
-	certExpiry             time.Duration
-	certBackdate           time.Duration
-	serialPrefix           int
-	maxNames               int
-	boulderIssuers         []*issuance.Issuer
-	keyPolicy              goodkey.KeyPolicy
-	fc                     clock.FakeClock
-	metrics                *caMetrics
-	logger                 *blog.Mock
+	pa             core.PolicyAuthority
+	ocsp           *ocspImpl
+	crl            *crlImpl
+	certProfiles   map[string]*issuance.ProfileConfig
+	serialPrefix   byte
+	maxNames       int
+	boulderIssuers []*issuance.Issuer
+	keyPolicy      goodkey.KeyPolicy
+	fc             clock.FakeClock
+	metrics        *caMetrics
+	logger         *blog.Mock
 }
 
 type mockSA struct {
@@ -153,33 +148,27 @@ func setup(t *testing.T) *testCtx {
 	fc := clock.NewFake()
 	fc.Add(1 * time.Hour)
 
-	pa, err := policy.New(nil, blog.NewMock())
+	pa, err := policy.New(map[identifier.IdentifierType]bool{"dns": true}, nil, blog.NewMock())
 	test.AssertNotError(t, err, "Couldn't create PA")
 	err = pa.LoadHostnamePolicyFile("../test/hostname-policy.yaml")
 	test.AssertNotError(t, err, "Couldn't set hostname policy")
 
-	certProfiles := make(map[string]issuance.ProfileConfig, 0)
-	certProfiles["defaultBoulderCertificateProfile"] = issuance.ProfileConfig{
-		AllowMustStaple: true,
-		AllowCTPoison:   true,
-		AllowSCTList:    true,
-		AllowCommonName: true,
-		Policies: []issuance.PolicyConfig{
-			{OID: "2.23.140.1.2.1"},
-		},
-		MaxValidityPeriod:   config.Duration{Duration: time.Hour * 8760},
-		MaxValidityBackdate: config.Duration{Duration: time.Hour},
+	certProfiles := make(map[string]*issuance.ProfileConfig, 0)
+	certProfiles["legacy"] = &issuance.ProfileConfig{
+		IncludeCRLDistributionPoints: true,
+		MaxValidityPeriod:            config.Duration{Duration: time.Hour * 24 * 90},
+		MaxValidityBackdate:          config.Duration{Duration: time.Hour},
+		IgnoredLints:                 []string{"w_subject_common_name_included"},
 	}
-	certProfiles["longerLived"] = issuance.ProfileConfig{
-		AllowMustStaple: true,
-		AllowCTPoison:   true,
-		AllowSCTList:    true,
-		AllowCommonName: true,
-		Policies: []issuance.PolicyConfig{
-			{OID: "2.23.140.1.2.1"},
-		},
-		MaxValidityPeriod:   config.Duration{Duration: time.Hour * 8761},
-		MaxValidityBackdate: config.Duration{Duration: time.Hour},
+	certProfiles["modern"] = &issuance.ProfileConfig{
+		OmitCommonName:               true,
+		OmitKeyEncipherment:          true,
+		OmitClientAuth:               true,
+		OmitSKID:                     true,
+		IncludeCRLDistributionPoints: true,
+		MaxValidityPeriod:            config.Duration{Duration: time.Hour * 24 * 6},
+		MaxValidityBackdate:          config.Duration{Duration: time.Hour},
+		IgnoredLints:                 []string{"w_ext_subject_key_identifier_missing_sub_cert"},
 	}
 	test.AssertEquals(t, len(certProfiles), 2)
 
@@ -190,6 +179,7 @@ func setup(t *testing.T) *testCtx {
 			IssuerURL:  fmt.Sprintf("http://not-example.com/i/%s", name),
 			OCSPURL:    "http://not-example.com/o",
 			CRLURLBase: fmt.Sprintf("http://not-example.com/c/%s/", name),
+			CRLShards:  10,
 			Location: issuance.IssuerLoc{
 				File:     fmt.Sprintf("../test/hierarchy/%s.key.pem", name),
 				CertFile: fmt.Sprintf("../test/hierarchy/%s.cert.pem", name),
@@ -216,10 +206,12 @@ func setup(t *testing.T) *testCtx {
 			Name: "lint_errors",
 			Help: "Number of issuances that were halted by linting errors",
 		})
-	cametrics := &caMetrics{signatureCount, signErrorCount, lintErrorCount}
-
-	lints, err := linter.NewRegistry([]string{"w_subject_common_name_included"})
-	test.AssertNotError(t, err, "Failed to create zlint registry")
+	certificatesCount := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "certificates",
+			Help: "Number of certificates issued",
+		}, []string{"profile"})
+	cametrics := &caMetrics{signatureCount, signErrorCount, lintErrorCount, certificatesCount}
 
 	ocsp, err := NewOCSPImpl(
 		boulderIssuers,
@@ -246,21 +238,17 @@ func setup(t *testing.T) *testCtx {
 	test.AssertNotError(t, err, "Failed to create crl impl")
 
 	return &testCtx{
-		pa:                     pa,
-		ocsp:                   ocsp,
-		crl:                    crl,
-		defaultCertProfileName: "defaultBoulderCertificateProfile",
-		lints:                  lints,
-		certProfiles:           certProfiles,
-		certExpiry:             8760 * time.Hour,
-		certBackdate:           time.Hour,
-		serialPrefix:           17,
-		maxNames:               2,
-		boulderIssuers:         boulderIssuers,
-		keyPolicy:              keyPolicy,
-		fc:                     fc,
-		metrics:                cametrics,
-		logger:                 blog.NewMock(),
+		pa:             pa,
+		ocsp:           ocsp,
+		crl:            crl,
+		certProfiles:   certProfiles,
+		serialPrefix:   0x11,
+		maxNames:       2,
+		boulderIssuers: boulderIssuers,
+		keyPolicy:      keyPolicy,
+		fc:             fc,
+		metrics:        cametrics,
+		logger:         blog.NewMock(),
 	}
 }
 
@@ -272,13 +260,9 @@ func TestSerialPrefix(t *testing.T) {
 		nil,
 		nil,
 		nil,
-		"",
 		nil,
 		nil,
-		nil,
-		testCtx.certExpiry,
-		testCtx.certBackdate,
-		0,
+		0x00,
 		testCtx.maxNames,
 		testCtx.keyPolicy,
 		testCtx.logger,
@@ -290,13 +274,9 @@ func TestSerialPrefix(t *testing.T) {
 		nil,
 		nil,
 		nil,
-		"",
 		nil,
 		nil,
-		nil,
-		testCtx.certExpiry,
-		testCtx.certBackdate,
-		128,
+		0x80,
 		testCtx.maxNames,
 		testCtx.keyPolicy,
 		testCtx.logger,
@@ -334,36 +314,29 @@ func TestIssuePrecertificate(t *testing.T) {
 		subTest func(t *testing.T, i *TestCertificateIssuance)
 	}{
 		{"IssuePrecertificate", CNandSANCSR, issueCertificateSubTestIssuePrecertificate},
-		{"ValidityUsesCAClock", CNandSANCSR, issueCertificateSubTestValidityUsesCAClock},
 		{"ProfileSelectionRSA", CNandSANCSR, issueCertificateSubTestProfileSelectionRSA},
 		{"ProfileSelectionECDSA", ECDSACSR, issueCertificateSubTestProfileSelectionECDSA},
-		{"MustStaple", MustStapleCSR, issueCertificateSubTestMustStaple},
 		{"UnknownExtension", UnsupportedExtensionCSR, issueCertificateSubTestUnknownExtension},
 		{"CTPoisonExtension", CTPoisonExtensionCSR, issueCertificateSubTestCTPoisonExtension},
 		{"CTPoisonExtensionEmpty", CTPoisonExtensionEmptyCSR, issueCertificateSubTestCTPoisonExtension},
 	}
 
 	for _, testCase := range testCases {
-		// TODO(#7454) Remove this rebinding
-		testCase := testCase
-
 		// The loop through the issuance modes must be inside the loop through
 		// |testCases| because the "certificate-for-precertificate" tests use
 		// the precertificates previously generated from the preceding
 		// "precertificate" test.
 		for _, mode := range []string{"precertificate", "certificate-for-precertificate"} {
-			ca, sa := issueCertificateSubTestSetup(t, nil)
+			ca, sa := issueCertificateSubTestSetup(t)
 			t.Run(fmt.Sprintf("%s - %s", mode, testCase.name), func(t *testing.T) {
 				t.Parallel()
 				req, err := x509.ParseCertificateRequest(testCase.csr)
 				test.AssertNotError(t, err, "Certificate request failed to parse")
-				issueReq := &capb.IssueCertificateRequest{Csr: testCase.csr, RegistrationID: arbitraryRegID}
+				issueReq := &capb.IssueCertificateRequest{Csr: testCase.csr, RegistrationID: mrand.Int63(), OrderID: mrand.Int63()}
 
-				var certDER []byte
-				response, err := ca.IssuePrecertificate(ctx, issueReq)
-
+				profile := ca.certProfiles["legacy"]
+				certDER, err := ca.issuePrecertificate(ctx, profile, issueReq)
 				test.AssertNotError(t, err, "Failed to issue precertificate")
-				certDER = response.DER
 
 				cert, err := x509.ParseCertificate(certDER)
 				test.AssertNotError(t, err, "Certificate failed to parse")
@@ -388,23 +361,21 @@ func TestIssuePrecertificate(t *testing.T) {
 	}
 }
 
-func issueCertificateSubTestSetup(t *testing.T, e *ECDSAAllowList) (*certificateAuthorityImpl, *mockSA) {
+type mockSCTService struct{}
+
+func (m mockSCTService) GetSCTs(ctx context.Context, sctRequest *rapb.SCTRequest, _ ...grpc.CallOption) (*rapb.SCTResponse, error) {
+	return &rapb.SCTResponse{}, nil
+}
+
+func issueCertificateSubTestSetup(t *testing.T) (*certificateAuthorityImpl, *mockSA) {
 	testCtx := setup(t)
-	ecdsaAllowList := &ECDSAAllowList{}
-	if e == nil {
-		e = ecdsaAllowList
-	}
 	sa := &mockSA{}
 	ca, err := NewCertificateAuthorityImpl(
 		sa,
+		mockSCTService{},
 		testCtx.pa,
 		testCtx.boulderIssuers,
-		testCtx.defaultCertProfileName,
 		testCtx.certProfiles,
-		testCtx.lints,
-		e,
-		testCtx.certExpiry,
-		testCtx.certBackdate,
 		testCtx.serialPrefix,
 		testCtx.maxNames,
 		testCtx.keyPolicy,
@@ -433,11 +404,6 @@ func issueCertificateSubTestIssuePrecertificate(t *testing.T, i *TestCertificate
 	}
 }
 
-func issueCertificateSubTestValidityUsesCAClock(t *testing.T, i *TestCertificateIssuance) {
-	test.AssertEquals(t, i.cert.NotBefore, i.ca.clk.Now().Add(-1*i.ca.backdate))
-	test.AssertEquals(t, i.cert.NotAfter.Add(time.Second).Sub(i.cert.NotBefore), i.ca.validityPeriod)
-}
-
 // Test failure mode when no issuers are present.
 func TestNoIssuers(t *testing.T) {
 	t.Parallel()
@@ -445,14 +411,10 @@ func TestNoIssuers(t *testing.T) {
 	sa := &mockSA{}
 	_, err := NewCertificateAuthorityImpl(
 		sa,
+		mockSCTService{},
 		testCtx.pa,
 		nil, // No issuers
-		testCtx.defaultCertProfileName,
 		testCtx.certProfiles,
-		testCtx.lints,
-		nil,
-		testCtx.certExpiry,
-		testCtx.certBackdate,
 		testCtx.serialPrefix,
 		testCtx.maxNames,
 		testCtx.keyPolicy,
@@ -470,14 +432,10 @@ func TestMultipleIssuers(t *testing.T) {
 	sa := &mockSA{}
 	ca, err := NewCertificateAuthorityImpl(
 		sa,
+		mockSCTService{},
 		testCtx.pa,
 		testCtx.boulderIssuers,
-		testCtx.defaultCertProfileName,
 		testCtx.certProfiles,
-		testCtx.lints,
-		nil,
-		testCtx.certExpiry,
-		testCtx.certBackdate,
 		testCtx.serialPrefix,
 		testCtx.maxNames,
 		testCtx.keyPolicy,
@@ -486,14 +444,11 @@ func TestMultipleIssuers(t *testing.T) {
 		testCtx.fc)
 	test.AssertNotError(t, err, "Failed to remake CA")
 
-	selectedProfile := ca.certProfiles.defaultName
-	_, ok := ca.certProfiles.profileByName[selectedProfile]
-	test.Assert(t, ok, "Certificate profile was expected to exist")
-
 	// Test that an RSA CSR gets issuance from an RSA issuer.
-	issuedCert, err := ca.IssuePrecertificate(ctx, &capb.IssueCertificateRequest{Csr: CNandSANCSR, RegistrationID: arbitraryRegID, CertProfileName: selectedProfile})
+	profile := ca.certProfiles["legacy"]
+	issuedCertDER, err := ca.issuePrecertificate(ctx, profile, &capb.IssueCertificateRequest{Csr: CNandSANCSR, RegistrationID: mrand.Int63(), OrderID: mrand.Int63()})
 	test.AssertNotError(t, err, "Failed to issue certificate")
-	cert, err := x509.ParseCertificate(issuedCert.DER)
+	cert, err := x509.ParseCertificate(issuedCertDER)
 	test.AssertNotError(t, err, "Certificate failed to parse")
 	validated := false
 	for _, issuer := range ca.issuers.byAlg[x509.RSA] {
@@ -507,9 +462,9 @@ func TestMultipleIssuers(t *testing.T) {
 	test.AssertMetricWithLabelsEquals(t, ca.metrics.signatureCount, prometheus.Labels{"purpose": "precertificate", "status": "success"}, 1)
 
 	// Test that an ECDSA CSR gets issuance from an ECDSA issuer.
-	issuedCert, err = ca.IssuePrecertificate(ctx, &capb.IssueCertificateRequest{Csr: ECDSACSR, RegistrationID: arbitraryRegID, CertProfileName: selectedProfile})
+	issuedCertDER, err = ca.issuePrecertificate(ctx, profile, &capb.IssueCertificateRequest{Csr: ECDSACSR, RegistrationID: mrand.Int63(), OrderID: mrand.Int63(), CertProfileName: "legacy"})
 	test.AssertNotError(t, err, "Failed to issue certificate")
-	cert, err = x509.ParseCertificate(issuedCert.DER)
+	cert, err = x509.ParseCertificate(issuedCertDER)
 	test.AssertNotError(t, err, "Certificate failed to parse")
 	validated = false
 	for _, issuer := range ca.issuers.byAlg[x509.ECDSA] {
@@ -538,6 +493,7 @@ func TestUnpredictableIssuance(t *testing.T) {
 			IssuerURL:  fmt.Sprintf("http://not-example.com/i/%s", name),
 			OCSPURL:    "http://not-example.com/o",
 			CRLURLBase: fmt.Sprintf("http://not-example.com/c/%s/", name),
+			CRLShards:  10,
 			Location: issuance.IssuerLoc{
 				File:     fmt.Sprintf("../test/hierarchy/%s.key.pem", name),
 				CertFile: fmt.Sprintf("../test/hierarchy/%s.cert.pem", name),
@@ -548,14 +504,10 @@ func TestUnpredictableIssuance(t *testing.T) {
 
 	ca, err := NewCertificateAuthorityImpl(
 		sa,
+		mockSCTService{},
 		testCtx.pa,
 		boulderIssuers,
-		testCtx.defaultCertProfileName,
 		testCtx.certProfiles,
-		testCtx.lints,
-		nil,
-		testCtx.certExpiry,
-		testCtx.certBackdate,
 		testCtx.serialPrefix,
 		testCtx.maxNames,
 		testCtx.keyPolicy,
@@ -576,13 +528,14 @@ func TestUnpredictableIssuance(t *testing.T) {
 	// trials, the probability that all 20 issuances come from the same issuer is
 	// 0.5 ^ 20 = 9.5e-7 ~= 1e-6 = 1 in a million, so we do not consider this test
 	// to be flaky.
-	req := &capb.IssueCertificateRequest{Csr: ECDSACSR, RegistrationID: arbitraryRegID}
+	req := &capb.IssueCertificateRequest{Csr: ECDSACSR, RegistrationID: mrand.Int63(), OrderID: mrand.Int63()}
 	seenE2 := false
 	seenR3 := false
+	profile := ca.certProfiles["legacy"]
 	for i := 0; i < 20; i++ {
-		result, err := ca.IssuePrecertificate(ctx, req)
+		precertDER, err := ca.issuePrecertificate(ctx, profile, req)
 		test.AssertNotError(t, err, "Failed to issue test certificate")
-		cert, err := x509.ParseCertificate(result.DER)
+		cert, err := x509.ParseCertificate(precertDER)
 		test.AssertNotError(t, err, "Failed to parse test certificate")
 		if strings.Contains(cert.Issuer.CommonName, "E1") {
 			t.Fatal("Issued certificate from inactive issuer")
@@ -596,207 +549,72 @@ func TestUnpredictableIssuance(t *testing.T) {
 	test.Assert(t, seenR3, "Expected at least one issuance from active issuer")
 }
 
-func TestProfiles(t *testing.T) {
+func TestMakeCertificateProfilesMap(t *testing.T) {
 	t.Parallel()
 	testCtx := setup(t)
 	test.AssertEquals(t, len(testCtx.certProfiles), 2)
 
-	sa := &mockSA{}
-
-	duplicateProfiles := make(map[string]issuance.ProfileConfig, 0)
-	// These profiles contain the same data which will produce an identical
-	// hash, even though the names are different.
-	duplicateProfiles["defaultBoulderCertificateProfile"] = issuance.ProfileConfig{
-		AllowMustStaple: false,
-		AllowCTPoison:   false,
-		AllowSCTList:    false,
-		AllowCommonName: false,
-		Policies: []issuance.PolicyConfig{
-			{OID: "2.23.140.1.2.1"},
-		},
-		MaxValidityPeriod:   config.Duration{Duration: time.Hour * 8760},
-		MaxValidityBackdate: config.Duration{Duration: time.Hour},
-	}
-	duplicateProfiles["uhoh_ohno"] = issuance.ProfileConfig{
-		AllowMustStaple: false,
-		AllowCTPoison:   false,
-		AllowSCTList:    false,
-		AllowCommonName: false,
-		Policies: []issuance.PolicyConfig{
-			{OID: "2.23.140.1.2.1"},
-		},
-		MaxValidityPeriod:   config.Duration{Duration: time.Hour * 8760},
-		MaxValidityBackdate: config.Duration{Duration: time.Hour},
-	}
-	test.AssertEquals(t, len(duplicateProfiles), 2)
-
-	jackedProfiles := make(map[string]issuance.ProfileConfig, 0)
-	jackedProfiles["ruhroh"] = issuance.ProfileConfig{
-		AllowMustStaple: false,
-		AllowCTPoison:   false,
-		AllowSCTList:    false,
-		AllowCommonName: false,
-		Policies: []issuance.PolicyConfig{
-			{OID: "2.23.140.1.2.1"},
-		},
-		MaxValidityPeriod:   config.Duration{Duration: time.Hour * 9000},
-		MaxValidityBackdate: config.Duration{Duration: time.Hour},
-	}
-	test.AssertEquals(t, len(jackedProfiles), 1)
-
-	type nameToHash struct {
-		name string
-		hash [32]byte
-	}
-
-	emptyMap := make(map[string]issuance.ProfileConfig, 0)
 	testCases := []struct {
 		name              string
-		profileConfigs    map[string]issuance.ProfileConfig
-		defaultName       string
+		profileConfigs    map[string]*issuance.ProfileConfig
 		expectedErrSubstr string
-		expectedProfiles  []nameToHash
+		expectedProfiles  []string
 	}{
-		{
-			name:              "no profiles",
-			profileConfigs:    emptyMap,
-			expectedErrSubstr: "at least one certificate profile",
-		},
 		{
 			name:              "nil profile map",
 			profileConfigs:    nil,
 			expectedErrSubstr: "at least one certificate profile",
 		},
 		{
-			name:              "duplicate hash",
-			profileConfigs:    duplicateProfiles,
-			expectedErrSubstr: "duplicate certificate profile hash",
+			name:              "no profiles",
+			profileConfigs:    map[string]*issuance.ProfileConfig{},
+			expectedErrSubstr: "at least one certificate profile",
 		},
 		{
-			name:           "default profiles from setup func",
-			profileConfigs: testCtx.certProfiles,
-			expectedProfiles: []nameToHash{
-				{
-					name: testCtx.defaultCertProfileName,
-					hash: [32]byte{205, 182, 88, 236, 32, 18, 154, 120, 148, 194, 42, 215, 117, 140, 13, 169, 127, 196, 219, 67, 82, 36, 147, 67, 254, 117, 65, 112, 202, 60, 185, 9},
-				},
-				{
-					name: "longerLived",
-					hash: [32]byte{80, 228, 198, 83, 7, 184, 187, 236, 113, 17, 103, 213, 226, 245, 172, 212, 135, 241, 125, 92, 122, 200, 34, 159, 139, 72, 191, 41, 1, 244, 86, 62},
-				},
+			name: "empty profile config",
+			profileConfigs: map[string]*issuance.ProfileConfig{
+				"empty": {},
 			},
+			expectedErrSubstr: "at least one revocation mechanism must be included",
 		},
 		{
-			name:              "no profile matching default name",
-			profileConfigs:    jackedProfiles,
-			expectedErrSubstr: "profile object was not found for that name",
-		},
-		{
-			name:           "certificate profile hash changed mid-issuance",
-			profileConfigs: jackedProfiles,
-			defaultName:    "ruhroh",
-			expectedProfiles: []nameToHash{
-				{
-					// We'll change the mapped hash key under the hood during
-					// the test.
-					name: "ruhroh",
-					hash: [32]byte{84, 131, 8, 59, 3, 244, 7, 36, 151, 161, 118, 68, 117, 183, 197, 177, 179, 232, 215, 10, 188, 48, 159, 195, 195, 140, 19, 204, 201, 182, 239, 235},
-				},
+			name: "minimal profile config",
+			profileConfigs: map[string]*issuance.ProfileConfig{
+				"empty": {IncludeCRLDistributionPoints: true},
 			},
+			expectedProfiles: []string{"empty"},
+		},
+		{
+			name:             "default profiles from setup func",
+			profileConfigs:   testCtx.certProfiles,
+			expectedProfiles: []string{"legacy", "modern"},
 		},
 	}
 
 	for _, tc := range testCases {
-		// TODO(#7454) Remove this rebinding
-		tc := tc
-		// This is handled by boulder-ca, not the CA package.
-		if tc.defaultName == "" {
-			tc.defaultName = testCtx.defaultCertProfileName
-		}
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			tCA, err := NewCertificateAuthorityImpl(
-				sa,
-				testCtx.pa,
-				testCtx.boulderIssuers,
-				tc.defaultName,
-				tc.profileConfigs,
-				testCtx.lints,
-				nil,
-				testCtx.certExpiry,
-				testCtx.certBackdate,
-				testCtx.serialPrefix,
-				testCtx.maxNames,
-				testCtx.keyPolicy,
-				testCtx.logger,
-				testCtx.metrics,
-				testCtx.fc,
-			)
+			profiles, err := makeCertificateProfilesMap(tc.profileConfigs)
 
 			if tc.expectedErrSubstr != "" {
+				test.AssertError(t, err, "profile construction should have failed")
 				test.AssertContains(t, err.Error(), tc.expectedErrSubstr)
-				test.AssertError(t, err, "No profile found during CA construction.")
 			} else {
-				test.AssertNotError(t, err, "Profiles should exist, but were not found")
+				test.AssertNotError(t, err, "profile construction should have succeeded")
 			}
 
 			if tc.expectedProfiles != nil {
-				test.AssertEquals(t, len(tc.expectedProfiles), len(tCA.certProfiles.profileByName))
+				test.AssertEquals(t, len(profiles), len(tc.expectedProfiles))
 			}
 
 			for _, expected := range tc.expectedProfiles {
-				cpwid, ok := tCA.certProfiles.profileByName[expected.name]
-				test.Assert(t, ok, "Profile name was not found, but should have been")
-				test.AssertEquals(t, expected.hash, cpwid.hash)
+				cpwid, ok := profiles[expected]
+				test.Assert(t, ok, fmt.Sprintf("expected profile %q not found", expected))
 
-				if tc.name == "certificate profile hash changed mid-issuance" {
-					// This is an attempt to simulate the hash changing, but the
-					// name remaining the same on a CA node in the duration
-					// between CA1 sending capb.IssuePrecerticateResponse and
-					// before the RA calls
-					// capb.IssueCertificateForPrecertificate. We expect the
-					// receiving CA2 to error that the hash we expect could not
-					// be found in the map.
-					originalHash := cpwid.hash
-					cpwid.hash = [32]byte{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 6, 6, 6}
-					test.AssertNotEquals(t, originalHash, cpwid.hash)
-				}
+				test.AssertEquals(t, cpwid.name, expected)
 			}
 		})
 	}
-}
-
-func TestECDSAAllowList(t *testing.T) {
-	t.Parallel()
-	req := &capb.IssueCertificateRequest{Csr: ECDSACSR, RegistrationID: arbitraryRegID}
-
-	// With allowlist containing arbitraryRegID, issuance should come from ECDSA issuer.
-	regIDMap := makeRegIDsMap([]int64{arbitraryRegID})
-	ca, _ := issueCertificateSubTestSetup(t, &ECDSAAllowList{regIDMap})
-	result, err := ca.IssuePrecertificate(ctx, req)
-	test.AssertNotError(t, err, "Failed to issue certificate")
-	cert, err := x509.ParseCertificate(result.DER)
-	test.AssertNotError(t, err, "Certificate failed to parse")
-	test.AssertEquals(t, cert.SignatureAlgorithm, x509.ECDSAWithSHA384)
-
-	// With allowlist not containing arbitraryRegID, issuance should fall back to RSA issuer.
-	regIDMap = makeRegIDsMap([]int64{2002})
-	ca, _ = issueCertificateSubTestSetup(t, &ECDSAAllowList{regIDMap})
-	result, err = ca.IssuePrecertificate(ctx, req)
-	test.AssertNotError(t, err, "Failed to issue certificate")
-	cert, err = x509.ParseCertificate(result.DER)
-	test.AssertNotError(t, err, "Certificate failed to parse")
-	test.AssertEquals(t, cert.SignatureAlgorithm, x509.SHA256WithRSA)
-
-	// With empty allowlist but ECDSAForAll enabled, issuance should come from ECDSA issuer.
-	ca, _ = issueCertificateSubTestSetup(t, nil)
-	features.Set(features.Config{ECDSAForAll: true})
-	defer features.Reset()
-	result, err = ca.IssuePrecertificate(ctx, req)
-	test.AssertNotError(t, err, "Failed to issue certificate")
-	cert, err = x509.ParseCertificate(result.DER)
-	test.AssertNotError(t, err, "Certificate failed to parse")
-	test.AssertEquals(t, cert.SignatureAlgorithm, x509.ECDSAWithSHA384)
 }
 
 func TestInvalidCSRs(t *testing.T) {
@@ -841,32 +659,20 @@ func TestInvalidCSRs(t *testing.T) {
 		// * Signature Algorithm: sha1WithRSAEncryption
 		{"RejectBadAlgorithm", "./testdata/bad_algorithm.der.csr", nil, "Issued a certificate based on a CSR with a bad signature algorithm.", berrors.BadCSR},
 
-		// CSR generated by Go:
-		// * Random RSA public key.
-		// * CN = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.com
-		// * DNSNames = [none]
-		{"RejectLongCommonName", "./testdata/long_cn.der.csr", nil, "Issued a certificate with a CN over 64 bytes.", berrors.BadCSR},
-
 		// CSR generated by OpenSSL:
 		// Edited signature to become invalid.
 		{"RejectWrongSignature", "./testdata/invalid_signature.der.csr", nil, "Issued a certificate based on a CSR with an invalid signature.", berrors.BadCSR},
 	}
 
 	for _, testCase := range testCases {
-		// TODO(#7454) Remove this rebinding
-		testCase := testCase
 		testCtx := setup(t)
 		sa := &mockSA{}
 		ca, err := NewCertificateAuthorityImpl(
 			sa,
+			mockSCTService{},
 			testCtx.pa,
 			testCtx.boulderIssuers,
-			testCtx.defaultCertProfileName,
 			testCtx.certProfiles,
-			testCtx.lints,
-			nil,
-			testCtx.certExpiry,
-			testCtx.certBackdate,
 			testCtx.serialPrefix,
 			testCtx.maxNames,
 			testCtx.keyPolicy,
@@ -878,8 +684,9 @@ func TestInvalidCSRs(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 			serializedCSR := mustRead(testCase.csrPath)
-			issueReq := &capb.IssueCertificateRequest{Csr: serializedCSR, RegistrationID: arbitraryRegID}
-			_, err = ca.IssuePrecertificate(ctx, issueReq)
+			profile := ca.certProfiles["legacy"]
+			issueReq := &capb.IssueCertificateRequest{Csr: serializedCSR, RegistrationID: mrand.Int63(), OrderID: mrand.Int63(), CertProfileName: "legacy"}
+			_, err = ca.issuePrecertificate(ctx, profile, issueReq)
 
 			test.AssertErrorIs(t, err, testCase.errorType)
 			test.AssertMetricWithLabelsEquals(t, ca.metrics.signatureCount, prometheus.Labels{"purpose": "cert"}, 0)
@@ -895,17 +702,17 @@ func TestInvalidCSRs(t *testing.T) {
 func TestRejectValidityTooLong(t *testing.T) {
 	t.Parallel()
 	testCtx := setup(t)
-	sa := &mockSA{}
+
+	// Jump to a time just moments before the test issuers expire.
+	future := testCtx.boulderIssuers[0].Cert.Certificate.NotAfter.Add(-1 * time.Hour)
+	testCtx.fc.Set(future)
+
 	ca, err := NewCertificateAuthorityImpl(
-		sa,
+		&mockSA{},
+		mockSCTService{},
 		testCtx.pa,
 		testCtx.boulderIssuers,
-		testCtx.defaultCertProfileName,
 		testCtx.certProfiles,
-		testCtx.lints,
-		nil,
-		testCtx.certExpiry,
-		testCtx.certBackdate,
 		testCtx.serialPrefix,
 		testCtx.maxNames,
 		testCtx.keyPolicy,
@@ -914,12 +721,9 @@ func TestRejectValidityTooLong(t *testing.T) {
 		testCtx.fc)
 	test.AssertNotError(t, err, "Failed to create CA")
 
-	future, err := time.Parse(time.RFC3339, "2025-02-10T00:30:00Z")
-
-	test.AssertNotError(t, err, "Failed to parse time")
-	testCtx.fc.Set(future)
 	// Test that the CA rejects CSRs that would expire after the intermediate cert
-	_, err = ca.IssuePrecertificate(ctx, &capb.IssueCertificateRequest{Csr: CNandSANCSR, RegistrationID: arbitraryRegID})
+	profile := ca.certProfiles["legacy"]
+	_, err = ca.issuePrecertificate(ctx, profile, &capb.IssueCertificateRequest{Csr: CNandSANCSR, RegistrationID: mrand.Int63(), OrderID: mrand.Int63(), CertProfileName: "legacy"})
 	test.AssertError(t, err, "Cannot issue a certificate that expires after the intermediate certificate")
 	test.AssertErrorIs(t, err, berrors.InternalServer)
 }
@@ -938,30 +742,12 @@ func issueCertificateSubTestProfileSelectionECDSA(t *testing.T, i *TestCertifica
 	test.AssertEquals(t, i.cert.KeyUsage, expectedKeyUsage)
 }
 
-func countMustStaple(t *testing.T, cert *x509.Certificate) (count int) {
-	oidTLSFeature := asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 1, 24}
-	mustStapleFeatureValue := []byte{0x30, 0x03, 0x02, 0x01, 0x05}
-	for _, ext := range cert.Extensions {
-		if ext.Id.Equal(oidTLSFeature) {
-			test.Assert(t, !ext.Critical, "Extension was marked critical")
-			test.AssertByteEquals(t, ext.Value, mustStapleFeatureValue)
-			count++
-		}
-	}
-	return count
-}
-
-func issueCertificateSubTestMustStaple(t *testing.T, i *TestCertificateIssuance) {
-	test.AssertMetricWithLabelsEquals(t, i.ca.metrics.signatureCount, prometheus.Labels{"purpose": "precertificate"}, 1)
-	test.AssertEquals(t, countMustStaple(t, i.cert), 1)
-}
-
 func issueCertificateSubTestUnknownExtension(t *testing.T, i *TestCertificateIssuance) {
 	test.AssertMetricWithLabelsEquals(t, i.ca.metrics.signatureCount, prometheus.Labels{"purpose": "precertificate"}, 1)
 
 	// NOTE: The hard-coded value here will have to change over time as Boulder
 	// adds or removes (unrequested/default) extensions in certificates.
-	expectedExtensionCount := 9
+	expectedExtensionCount := 10
 	test.AssertEquals(t, len(i.cert.Extensions), expectedExtensionCount)
 }
 
@@ -999,14 +785,10 @@ func TestIssueCertificateForPrecertificate(t *testing.T) {
 	sa := &mockSA{}
 	ca, err := NewCertificateAuthorityImpl(
 		sa,
+		mockSCTService{},
 		testCtx.pa,
 		testCtx.boulderIssuers,
-		testCtx.defaultCertProfileName,
 		testCtx.certProfiles,
-		testCtx.lints,
-		nil,
-		testCtx.certExpiry,
-		testCtx.certBackdate,
 		testCtx.serialPrefix,
 		testCtx.maxNames,
 		testCtx.keyPolicy,
@@ -1015,13 +797,11 @@ func TestIssueCertificateForPrecertificate(t *testing.T) {
 		testCtx.fc)
 	test.AssertNotError(t, err, "Failed to create CA")
 
-	_, ok := ca.certProfiles.profileByName[ca.certProfiles.defaultName]
-	test.Assert(t, ok, "Certificate profile was expected to exist")
-
-	issueReq := capb.IssueCertificateRequest{Csr: CNandSANCSR, RegistrationID: arbitraryRegID, OrderID: 0}
-	precert, err := ca.IssuePrecertificate(ctx, &issueReq)
+	profile := ca.certProfiles["legacy"]
+	issueReq := capb.IssueCertificateRequest{Csr: CNandSANCSR, RegistrationID: mrand.Int63(), OrderID: mrand.Int63(), CertProfileName: "legacy"}
+	precertDER, err := ca.issuePrecertificate(ctx, profile, &issueReq)
 	test.AssertNotError(t, err, "Failed to issue precert")
-	parsedPrecert, err := x509.ParseCertificate(precert.DER)
+	parsedPrecert, err := x509.ParseCertificate(precertDER)
 	test.AssertNotError(t, err, "Failed to parse precert")
 	test.AssertMetricWithLabelsEquals(t, ca.metrics.signatureCount, prometheus.Labels{"purpose": "precertificate", "status": "success"}, 1)
 	test.AssertMetricWithLabelsEquals(t, ca.metrics.signatureCount, prometheus.Labels{"purpose": "certificate", "status": "success"}, 0)
@@ -1038,15 +818,14 @@ func TestIssueCertificateForPrecertificate(t *testing.T) {
 	}
 
 	test.AssertNotError(t, err, "Failed to marshal SCT")
-	cert, err := ca.IssueCertificateForPrecertificate(ctx, &capb.IssueCertificateForPrecertificateRequest{
-		DER:             precert.DER,
-		SCTs:            sctBytes,
-		RegistrationID:  arbitraryRegID,
-		OrderID:         0,
-		CertProfileHash: precert.CertProfileHash,
-	})
+	certDER, err := ca.issueCertificateForPrecertificate(ctx,
+		profile,
+		precertDER,
+		sctBytes,
+		mrand.Int63(),
+		mrand.Int63())
 	test.AssertNotError(t, err, "Failed to issue cert from precert")
-	parsedCert, err := x509.ParseCertificate(cert.Der)
+	parsedCert, err := x509.ParseCertificate(certDER)
 	test.AssertNotError(t, err, "Failed to parse cert")
 	test.AssertMetricWithLabelsEquals(t, ca.metrics.signatureCount, prometheus.Labels{"purpose": "certificate", "status": "success"}, 1)
 
@@ -1068,14 +847,10 @@ func TestIssueCertificateForPrecertificateWithSpecificCertificateProfile(t *test
 	sa := &mockSA{}
 	ca, err := NewCertificateAuthorityImpl(
 		sa,
+		mockSCTService{},
 		testCtx.pa,
 		testCtx.boulderIssuers,
-		testCtx.defaultCertProfileName,
 		testCtx.certProfiles,
-		testCtx.lints,
-		nil,
-		testCtx.certExpiry,
-		testCtx.certBackdate,
 		testCtx.serialPrefix,
 		testCtx.maxNames,
 		testCtx.keyPolicy,
@@ -1084,19 +859,19 @@ func TestIssueCertificateForPrecertificateWithSpecificCertificateProfile(t *test
 		testCtx.fc)
 	test.AssertNotError(t, err, "Failed to create CA")
 
-	selectedProfile := "longerLived"
-	certProfile, ok := ca.certProfiles.profileByName[selectedProfile]
+	selectedProfile := "modern"
+	certProfile, ok := ca.certProfiles[selectedProfile]
 	test.Assert(t, ok, "Certificate profile was expected to exist")
 
 	issueReq := capb.IssueCertificateRequest{
 		Csr:             CNandSANCSR,
-		RegistrationID:  arbitraryRegID,
-		OrderID:         0,
+		RegistrationID:  mrand.Int63(),
+		OrderID:         mrand.Int63(),
 		CertProfileName: selectedProfile,
 	}
-	precert, err := ca.IssuePrecertificate(ctx, &issueReq)
+	precertDER, err := ca.issuePrecertificate(ctx, certProfile, &issueReq)
 	test.AssertNotError(t, err, "Failed to issue precert")
-	parsedPrecert, err := x509.ParseCertificate(precert.DER)
+	parsedPrecert, err := x509.ParseCertificate(precertDER)
 	test.AssertNotError(t, err, "Failed to parse precert")
 	test.AssertMetricWithLabelsEquals(t, ca.metrics.signatureCount, prometheus.Labels{"purpose": "precertificate", "status": "success"}, 1)
 	test.AssertMetricWithLabelsEquals(t, ca.metrics.signatureCount, prometheus.Labels{"purpose": "certificate", "status": "success"}, 0)
@@ -1113,15 +888,14 @@ func TestIssueCertificateForPrecertificateWithSpecificCertificateProfile(t *test
 	}
 
 	test.AssertNotError(t, err, "Failed to marshal SCT")
-	cert, err := ca.IssueCertificateForPrecertificate(ctx, &capb.IssueCertificateForPrecertificateRequest{
-		DER:             precert.DER,
-		SCTs:            sctBytes,
-		RegistrationID:  arbitraryRegID,
-		OrderID:         0,
-		CertProfileHash: certProfile.hash[:],
-	})
+	certDER, err := ca.issueCertificateForPrecertificate(ctx,
+		certProfile,
+		precertDER,
+		sctBytes,
+		mrand.Int63(),
+		mrand.Int63())
 	test.AssertNotError(t, err, "Failed to issue cert from precert")
-	parsedCert, err := x509.ParseCertificate(cert.Der)
+	parsedCert, err := x509.ParseCertificate(certDER)
 	test.AssertNotError(t, err, "Failed to parse cert")
 	test.AssertMetricWithLabelsEquals(t, ca.metrics.signatureCount, prometheus.Labels{"purpose": "certificate", "status": "success"}, 1)
 
@@ -1188,14 +962,10 @@ func TestIssueCertificateForPrecertificateDuplicateSerial(t *testing.T) {
 	sa := &dupeSA{}
 	ca, err := NewCertificateAuthorityImpl(
 		sa,
+		mockSCTService{},
 		testCtx.pa,
 		testCtx.boulderIssuers,
-		testCtx.defaultCertProfileName,
 		testCtx.certProfiles,
-		testCtx.lints,
-		nil,
-		testCtx.certExpiry,
-		testCtx.certBackdate,
 		testCtx.serialPrefix,
 		testCtx.maxNames,
 		testCtx.keyPolicy,
@@ -1209,21 +979,17 @@ func TestIssueCertificateForPrecertificateDuplicateSerial(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	selectedProfile := ca.certProfiles.defaultName
-	certProfile, ok := ca.certProfiles.profileByName[selectedProfile]
-	test.Assert(t, ok, "Certificate profile was expected to exist")
-
-	issueReq := capb.IssueCertificateRequest{Csr: CNandSANCSR, RegistrationID: arbitraryRegID, OrderID: 0}
-	precert, err := ca.IssuePrecertificate(ctx, &issueReq)
+	profile := ca.certProfiles["legacy"]
+	issueReq := capb.IssueCertificateRequest{Csr: CNandSANCSR, RegistrationID: mrand.Int63(), OrderID: mrand.Int63(), CertProfileName: "legacy"}
+	precertDER, err := ca.issuePrecertificate(ctx, profile, &issueReq)
 	test.AssertNotError(t, err, "Failed to issue precert")
 	test.AssertMetricWithLabelsEquals(t, ca.metrics.signatureCount, prometheus.Labels{"purpose": "precertificate", "status": "success"}, 1)
-	_, err = ca.IssueCertificateForPrecertificate(ctx, &capb.IssueCertificateForPrecertificateRequest{
-		DER:             precert.DER,
-		SCTs:            sctBytes,
-		RegistrationID:  arbitraryRegID,
-		OrderID:         0,
-		CertProfileHash: certProfile.hash[:],
-	})
+	_, err = ca.issueCertificateForPrecertificate(ctx,
+		profile,
+		precertDER,
+		sctBytes,
+		mrand.Int63(),
+		mrand.Int63())
 	if err == nil {
 		t.Error("Expected error issuing duplicate serial but got none.")
 	}
@@ -1239,14 +1005,10 @@ func TestIssueCertificateForPrecertificateDuplicateSerial(t *testing.T) {
 	errorsa := &getCertErrorSA{}
 	errorca, err := NewCertificateAuthorityImpl(
 		errorsa,
+		mockSCTService{},
 		testCtx.pa,
 		testCtx.boulderIssuers,
-		testCtx.defaultCertProfileName,
 		testCtx.certProfiles,
-		testCtx.lints,
-		nil,
-		testCtx.certExpiry,
-		testCtx.certBackdate,
 		testCtx.serialPrefix,
 		testCtx.maxNames,
 		testCtx.keyPolicy,
@@ -1255,13 +1017,12 @@ func TestIssueCertificateForPrecertificateDuplicateSerial(t *testing.T) {
 		testCtx.fc)
 	test.AssertNotError(t, err, "Failed to create CA")
 
-	_, err = errorca.IssueCertificateForPrecertificate(ctx, &capb.IssueCertificateForPrecertificateRequest{
-		DER:             precert.DER,
-		SCTs:            sctBytes,
-		RegistrationID:  arbitraryRegID,
-		OrderID:         0,
-		CertProfileHash: certProfile.hash[:],
-	})
+	_, err = errorca.issueCertificateForPrecertificate(ctx,
+		profile,
+		precertDER,
+		sctBytes,
+		mrand.Int63(),
+		mrand.Int63())
 	if err == nil {
 		t.Fatal("Expected error issuing duplicate serial but got none.")
 	}
@@ -1369,8 +1130,6 @@ func TestVerifyTBSCertIsDeterministic(t *testing.T) {
 	}
 
 	for _, testCase := range testCases {
-		// TODO(#7454) Remove this rebinding
-		testCase := testCase
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 			err := tbsCertIsDeterministic(testCase.lintCertBytes, testCase.leafCertBytes)

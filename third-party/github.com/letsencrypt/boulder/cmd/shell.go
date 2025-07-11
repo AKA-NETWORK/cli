@@ -31,9 +31,10 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	"go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.25.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.30.0"
 	"google.golang.org/grpc/grpclog"
 
+	"github.com/letsencrypt/boulder/config"
 	"github.com/letsencrypt/boulder/core"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/strictyaml"
@@ -221,7 +222,7 @@ func NewLogger(logConf SyslogConfig) blog.Logger {
 	// Boulder's conception of time.
 	go func() {
 		for {
-			time.Sleep(time.Minute)
+			time.Sleep(time.Hour)
 			logger.Info(fmt.Sprintf("time=%s", time.Now().Format(time.RFC3339Nano)))
 		}
 	}()
@@ -260,6 +261,12 @@ func newVersionCollector() prometheus.Collector {
 
 func newStatsRegistry(addr string, logger blog.Logger) prometheus.Registerer {
 	registry := prometheus.NewRegistry()
+
+	if addr == "" {
+		logger.Info("No debug listen address specified")
+		return registry
+	}
+
 	registry.MustRegister(collectors.NewGoCollector())
 	registry.MustRegister(collectors.NewProcessCollector(
 		collectors.ProcessCollectorOpts{}))
@@ -286,10 +293,6 @@ func newStatsRegistry(addr string, logger blog.Logger) prometheus.Registerer {
 		ErrorLog: promLogger{logger},
 	}))
 
-	if addr == "" {
-		logger.Err("Debug listen address is not configured")
-		os.Exit(1)
-	}
 	logger.Infof("Debug server listening on %s", addr)
 
 	server := http.Server{
@@ -313,20 +316,15 @@ func NewOpenTelemetry(config OpenTelemetryConfig, logger blog.Logger) func(ctx c
 	otel.SetLogger(stdr.New(logOutput{logger}))
 	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) { logger.Errf("OpenTelemetry error: %v", err) }))
 
-	r, err := resource.Merge(
-		resource.Default(),
-		resource.NewWithAttributes(
-			semconv.SchemaURL,
-			semconv.ServiceNameKey.String(core.Command()),
-			semconv.ServiceVersionKey.String(core.GetBuildID()),
-		),
+	resources := resource.NewWithAttributes(
+		semconv.SchemaURL,
+		semconv.ServiceName(core.Command()),
+		semconv.ServiceVersion(core.GetBuildID()),
+		semconv.ProcessPID(os.Getpid()),
 	)
-	if err != nil {
-		FailOnError(err, "Could not create OpenTelemetry resource")
-	}
 
 	opts := []trace.TracerProviderOption{
-		trace.WithResource(r),
+		trace.WithResource(resources),
 		// Use a ParentBased sampler to respect the sample decisions on incoming
 		// traces, and TraceIDRatioBased to randomly sample new traces.
 		trace.WithSampler(trace.ParentBased(trace.TraceIDRatioBased(config.SampleRatio))),
@@ -455,6 +453,9 @@ func ValidateJSONConfig(cv *ConfigValidator, in io.Reader) error {
 		}
 	}
 
+	// Register custom types for use with existing validation tags.
+	validate.RegisterCustomTypeFunc(config.DurationCustomTypeFunc, config.Duration{})
+
 	err := decodeJSONStrict(in, cv.Config)
 	if err != nil {
 		return err
@@ -496,6 +497,9 @@ func ValidateYAMLConfig(cv *ConfigValidator, in io.Reader) error {
 			return err
 		}
 	}
+
+	// Register custom types for use with existing validation tags.
+	validate.RegisterCustomTypeFunc(config.DurationCustomTypeFunc, config.Duration{})
 
 	inBytes, err := io.ReadAll(in)
 	if err != nil {

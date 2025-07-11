@@ -5,21 +5,25 @@ import (
 	"errors"
 	"fmt"
 
-	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
+	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-middleware/providers/prometheus"
 	"github.com/jmhodges/clock"
-	"github.com/letsencrypt/boulder/cmd"
-	bcreds "github.com/letsencrypt/boulder/grpc/creds"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 
-	// 'grpc/health' is imported for its init function, which causes clients to
-	// rely on the Health Service for load-balancing.
+	"github.com/letsencrypt/boulder/cmd"
+	bcreds "github.com/letsencrypt/boulder/grpc/creds"
+
 	// 'grpc/internal/resolver/dns' is imported for its init function, which
 	// registers the SRV resolver.
-	_ "github.com/letsencrypt/boulder/grpc/internal/resolver/dns"
 	"google.golang.org/grpc/balancer/roundrobin"
+
+	// 'grpc/health' is imported for its init function, which causes clients to
+	// rely on the Health Service for load-balancing as long as a
+	// "healthCheckConfig" is specified in the gRPC service config.
 	_ "google.golang.org/grpc/health"
+
+	_ "github.com/letsencrypt/boulder/grpc/internal/resolver/dns"
 )
 
 // ClientSetup creates a gRPC TransportCredentials that presents
@@ -44,13 +48,11 @@ func ClientSetup(c *cmd.GRPCClientConfig, tlsConfig *tls.Config, statsRegistry p
 	unaryInterceptors := []grpc.UnaryClientInterceptor{
 		cmi.Unary,
 		cmi.metrics.grpcMetrics.UnaryClientInterceptor(),
-		otelgrpc.UnaryClientInterceptor(),
 	}
 
 	streamInterceptors := []grpc.StreamClientInterceptor{
 		cmi.Stream,
 		cmi.metrics.grpcMetrics.StreamClientInterceptor(),
-		otelgrpc.StreamClientInterceptor(),
 	}
 
 	target, hostOverride, err := c.MakeTargetAndHostOverride()
@@ -59,12 +61,27 @@ func ClientSetup(c *cmd.GRPCClientConfig, tlsConfig *tls.Config, statsRegistry p
 	}
 
 	creds := bcreds.NewClientCredentials(tlsConfig.RootCAs, tlsConfig.Certificates, hostOverride)
-	return grpc.Dial(
+	return grpc.NewClient(
 		target,
-		grpc.WithDefaultServiceConfig(fmt.Sprintf(`{"loadBalancingConfig": [{"%s":{}}]}`, roundrobin.Name)),
+		grpc.WithDefaultServiceConfig(
+			fmt.Sprintf(
+				// By setting the service name to an empty string in
+				// healthCheckConfig, we're instructing the gRPC client to query
+				// the overall health status of each server. The grpc-go health
+				// server, as constructed by health.NewServer(), unconditionally
+				// sets the overall service (e.g. "") status to SERVING. If a
+				// specific service name were set, the server would need to
+				// explicitly transition that service to SERVING; otherwise,
+				// clients would receive a NOT_FOUND status and the connection
+				// would be marked as unhealthy (TRANSIENT_FAILURE).
+				`{"healthCheckConfig": {"serviceName": ""},"loadBalancingConfig": [{"%s":{}}]}`,
+				roundrobin.Name,
+			),
+		),
 		grpc.WithTransportCredentials(creds),
 		grpc.WithChainUnaryInterceptor(unaryInterceptors...),
 		grpc.WithChainStreamInterceptor(streamInterceptors...),
+		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
 	)
 }
 
@@ -82,8 +99,11 @@ type clientMetrics struct {
 // maximum of once per registry, or there will be conflicting names.
 func newClientMetrics(stats prometheus.Registerer) (clientMetrics, error) {
 	// Create the grpc prometheus client metrics instance and register it
-	grpcMetrics := grpc_prometheus.NewClientMetrics()
-	grpcMetrics.EnableClientHandlingTimeHistogram()
+	grpcMetrics := grpc_prometheus.NewClientMetrics(
+		grpc_prometheus.WithClientHandlingTimeHistogram(
+			grpc_prometheus.WithHistogramBuckets([]float64{.01, .025, .05, .1, .5, 1, 2.5, 5, 10, 45, 90}),
+		),
+	)
 	err := stats.Register(grpcMetrics)
 	if err != nil {
 		are := prometheus.AlreadyRegisteredError{}

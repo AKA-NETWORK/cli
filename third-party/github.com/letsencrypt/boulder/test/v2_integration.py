@@ -10,8 +10,6 @@ import os
 import json
 import re
 
-import OpenSSL
-
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -159,7 +157,7 @@ def test_http_challenge_broken_redirect():
         redirect)
 
     # Expect the specialized error message
-    expectedError = "10.77.77.77: Fetching {0}: Invalid host in redirect target \"{1}.well-known\". Check webserver config for missing '/' in redirect target.".format(redirect, d)
+    expectedError = "64.112.117.122: Fetching {0}: Invalid host in redirect target \"{1}.well-known\". Check webserver config for missing '/' in redirect target.".format(redirect, d)
 
     # NOTE(@cpu): Can't use chisel2.expect_problem here because it doesn't let
     # us interrogate the detail message easily.
@@ -180,7 +178,7 @@ def test_failed_validation_limit():
     """
     Fail a challenge repeatedly for the same domain, with the same account. Once
     we reach the rate limit we should get a rateLimitedError. Note that this
-    depends on the specific threshold configured in rate-limit-policies.yml.
+    depends on the specific threshold configured.
 
     This also incidentally tests a fix for
     https://github.com/letsencrypt/boulder/issues/4329. We expect to get
@@ -365,7 +363,7 @@ def test_http_challenge_https_redirect():
 
     # Also add an A record for the domain pointing to the interface that the
     # HTTPS HTTP-01 challtestsrv is bound.
-    challSrv.add_a_record(d, ["10.77.77.77"])
+    challSrv.add_a_record(d, ["64.112.117.122"])
 
     try:
         chisel2.auth_and_issue([d], client=client, chall_type="http-01")
@@ -447,10 +445,10 @@ def test_http_challenge_timeout():
     to a slow HTTP server appropriately.
     """
     # Start a simple python HTTP server on port 80 in its own thread.
-    # NOTE(@cpu): The pebble-challtestsrv binds 10.77.77.77:80 for HTTP-01
-    # challenges so we must use the 10.88.88.88 address for the throw away
+    # NOTE(@cpu): The chall-test-srv binds 64.112.117.122:80 for HTTP-01
+    # challenges so we must use the 64.112.117.134 address for the throw away
     # server for this test and add a mock DNS entry that directs the VA to it.
-    httpd = SlowHTTPServer(("10.88.88.88", 80), SlowHTTPRequestHandler)
+    httpd = SlowHTTPServer(("64.112.117.134", 80), SlowHTTPRequestHandler)
     thread = threading.Thread(target = httpd.serve_forever)
     thread.daemon = False
     thread.start()
@@ -460,7 +458,7 @@ def test_http_challenge_timeout():
 
     # Add A record for the domains to ensure the VA's requests are directed
     # to the interface that we bound the HTTPServer to.
-    challSrv.add_a_record(hostname, ["10.88.88.88"])
+    challSrv.add_a_record(hostname, ["64.112.117.134"])
 
     start = datetime.datetime.utcnow()
     end = 0
@@ -492,7 +490,7 @@ def test_tls_alpn_challenge():
     # to the interface that the challtestsrv has bound for TLS-ALPN-01 challenge
     # responses
     for host in domains:
-        challSrv.add_a_record(host, ["10.88.88.88"])
+        challSrv.add_a_record(host, ["64.112.117.134"])
     chisel2.auth_and_issue(domains, chall_type="tls-alpn-01")
 
     for host in domains:
@@ -649,215 +647,6 @@ def test_order_reuse_failed_authz():
     finally:
         cleanup()
 
-def test_order_finalize_early():
-    """
-    Test that finalizing an order before its fully authorized results in the
-    order having an error set and the status being invalid.
-    """
-    # Create a client
-    client = chisel2.make_client(None)
-
-    # Create a random domain and a csr
-    domains = [ random_domain() ]
-    csr_pem = chisel2.make_csr(domains)
-
-    # Create an order for the domain
-    order = client.new_order(csr_pem)
-
-    deadline = datetime.datetime.now() + datetime.timedelta(seconds=5)
-
-    # Finalizing an order early should generate an orderNotReady error.
-    chisel2.expect_problem("urn:ietf:params:acme:error:orderNotReady",
-        lambda: client.finalize_order(order, deadline))
-
-def test_revoke_by_account_unspecified():
-    client = chisel2.make_client()
-    cert_file = temppath('test_revoke_by_account_0.pem')
-    order = chisel2.auth_and_issue([random_domain()], client=client, cert_output=cert_file.name)
-    cert = OpenSSL.crypto.load_certificate(OpenSSL.crypto.FILETYPE_PEM, order.fullchain_pem)
-
-    reset_akamai_purges()
-    client.revoke(josepy.ComparableX509(cert), 0)
-
-    verify_ocsp(cert_file.name, "test/certs/webpki/int-rsa-*.cert.pem", "http://localhost:4002", "revoked")
-    verify_akamai_purge()
-
-def test_revoke_by_account_with_reason():
-    client = chisel2.make_client(None)
-    cert_file = temppath('test_revoke_by_account_1.pem')
-    order = chisel2.auth_and_issue([random_domain()], client=client, cert_output=cert_file.name)
-    cert = OpenSSL.crypto.load_certificate(OpenSSL.crypto.FILETYPE_PEM, order.fullchain_pem)
-
-    reset_akamai_purges()
-
-    # Requesting revocation for keyCompromise should work, but not block the
-    # key.
-    client.revoke(josepy.ComparableX509(cert), 1)
-    verify_ocsp(cert_file.name, "test/certs/webpki/int-rsa-*.cert.pem", "http://localhost:4002", "revoked", "keyCompromise")
-
-    verify_akamai_purge()
-
-def test_revoke_by_authz():
-    domains = [random_domain()]
-    cert_file = temppath('test_revoke_by_authz.pem')
-    order = chisel2.auth_and_issue(domains, cert_output=cert_file.name)
-    cert = OpenSSL.crypto.load_certificate(OpenSSL.crypto.FILETYPE_PEM, order.fullchain_pem)
-
-    # create a new client and re-authz
-    client = chisel2.make_client(None)
-    chisel2.auth_and_issue(domains, client=client)
-
-    reset_akamai_purges()
-
-    # Even though we requested reason 1 ("keyCompromise"), the result should be
-    # 5 ("cessationOfOperation") due to the authorization method.
-    client.revoke(josepy.ComparableX509(cert), 1)
-    verify_ocsp(cert_file.name, "test/certs/webpki/int-rsa-*.cert.pem", "http://localhost:4002", "revoked", "cessationOfOperation")
-
-    verify_akamai_purge()
-
-def test_revoke_by_privkey():
-    domains = [random_domain()]
-
-    # We have to make our own CSR so that we can hold on to the private key
-    # for revocation later.
-    key = rsa.generate_private_key(65537, 2048, default_backend())
-    key_pem = key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.TraditionalOpenSSL,
-        encryption_algorithm=serialization.NoEncryption()
-    )
-    csr_pem = acme_crypto_util.make_csr(key_pem, domains, False)
-
-    # We have to do our own issuance because we made our own CSR.
-    issue_client = chisel2.make_client(None)
-    order = issue_client.new_order(csr_pem)
-    cleanup = chisel2.do_http_challenges(issue_client, order.authorizations)
-    try:
-        order = issue_client.poll_and_finalize(order)
-    finally:
-        cleanup()
-    cert = OpenSSL.crypto.load_certificate(OpenSSL.crypto.FILETYPE_PEM, order.fullchain_pem)
-
-    cert_file = tempfile.NamedTemporaryFile(
-        dir=tempdir, suffix='.test_revoke_by_privkey.pem',
-        mode='w+', delete=False)
-    cert_file.write(OpenSSL.crypto.dump_certificate(
-        OpenSSL.crypto.FILETYPE_PEM, cert).decode())
-    cert_file.close()
-
-    # Create a new client with the cert key as the account key. We don't
-    # register a server-side account with this client, as we don't need one.
-    revoke_client = chisel2.uninitialized_client(key=josepy.JWKRSA(key=key))
-
-    reset_akamai_purges()
-
-    # Even though we requested reason 0 ("unspecified"), the result should be
-    # 1 ("keyCompromise") due to the authorization method.
-    revoke_client.revoke(josepy.ComparableX509(cert), 0)
-    verify_ocsp(cert_file.name, "test/certs/webpki/int-rsa-*.cert.pem", "http://localhost:4002", "revoked", "keyCompromise")
-
-    verify_akamai_purge()
-
-def test_double_revocation():
-    domains = [random_domain()]
-
-    # We have to make our own CSR so that we can hold on to the private key
-    # for revocation later.
-    key = rsa.generate_private_key(65537, 2048, default_backend())
-    key_pem = key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.TraditionalOpenSSL,
-        encryption_algorithm=serialization.NoEncryption()
-    )
-    csr_pem = acme_crypto_util.make_csr(key_pem, domains, False)
-
-    # We have to do our own issuance because we made our own CSR.
-    sub_client = chisel2.make_client(None)
-    order = sub_client.new_order(csr_pem)
-    cleanup = chisel2.do_http_challenges(sub_client, order.authorizations)
-    try:
-        order = sub_client.poll_and_finalize(order)
-    finally:
-        cleanup()
-    cert = OpenSSL.crypto.load_certificate(OpenSSL.crypto.FILETYPE_PEM, order.fullchain_pem)
-
-    cert_file = tempfile.NamedTemporaryFile(
-        dir=tempdir, suffix='.test_double_revoke.pem',
-        mode='w+', delete=False)
-    cert_file.write(OpenSSL.crypto.dump_certificate(
-        OpenSSL.crypto.FILETYPE_PEM, cert).decode())
-    cert_file.close()
-
-    # Create a new client with the cert key as the account key. We don't
-    # register a server-side account with this client, as we don't need one.
-    cert_client = chisel2.uninitialized_client(key=josepy.JWKRSA(key=key))
-
-    reset_akamai_purges()
-
-    # First revoke for any reason.
-    sub_client.revoke(josepy.ComparableX509(cert), 0)
-    verify_ocsp(cert_file.name, "test/certs/webpki/int-rsa-*.cert.pem", "http://localhost:4002", "revoked")
-    verify_akamai_purge()
-
-    # Re-revocation for anything other than keyCompromise should fail.
-    try:
-        sub_client.revoke(josepy.ComparableX509(cert), 3)
-    except messages.Error:
-        pass
-    else:
-        raise(Exception("Re-revoked for a bad reason"))
-
-    # Re-revocation for keyCompromise should work, as long as it is done
-    # via the cert key to demonstrate said compromise.
-    reset_akamai_purges()
-    cert_client.revoke(josepy.ComparableX509(cert), 1)
-    verify_ocsp(cert_file.name, "test/certs/webpki/int-rsa-*.cert.pem", "http://localhost:4002", "revoked", "keyCompromise")
-    verify_akamai_purge()
-
-    # A subsequent attempt should fail, because the cert is already revoked
-    # for keyCompromise.
-    try:
-        cert_client.revoke(josepy.ComparableX509(cert), 1)
-    except messages.Error:
-        pass
-    else:
-        raise(Exception("Re-revoked already keyCompromise'd cert"))
-
-    # The same is true even when using the cert key.
-    try:
-        cert_client.revoke(josepy.ComparableX509(cert), 1)
-    except messages.Error:
-        pass
-    else:
-        raise(Exception("Re-revoked already keyCompromise'd cert"))
-
-def test_sct_embedding():
-    order = chisel2.auth_and_issue([random_domain()])
-    print(order.fullchain_pem.encode())
-    cert = parse_cert(order)
-
-    # make sure there is no poison extension
-    try:
-        cert.extensions.get_extension_for_oid(x509.ObjectIdentifier("1.3.6.1.4.1.11129.2.4.3"))
-        raise(Exception("certificate contains CT poison extension"))
-    except x509.ExtensionNotFound:
-        # do nothing
-        pass
-
-    # make sure there is a SCT list extension
-    try:
-        sctList = cert.extensions.get_extension_for_oid(x509.ObjectIdentifier("1.3.6.1.4.1.11129.2.4.2"))
-    except x509.ExtensionNotFound:
-        raise(Exception("certificate doesn't contain SCT list extension"))
-    if len(sctList.value) != 2:
-        raise(Exception("SCT list contains wrong number of SCTs"))
-    for sct in sctList.value:
-        if sct.version != x509.certificate_transparency.Version.v1:
-            raise(Exception("SCT contains wrong version"))
-        if sct.entry_type != x509.certificate_transparency.LogEntryType.PRE_CERTIFICATE:
-            raise(Exception("SCT contains wrong entry type"))
-
 def test_only_return_existing_reg():
     client = chisel2.uninitialized_client()
     email = "test@not-example.com"
@@ -970,20 +759,20 @@ def multiva_setup(client, guestlist):
 
     # Add an A record for the domains to ensure the VA's requests are directed
     # to the interface that we bound the HTTPServer to.
-    challSrv.add_a_record(hostname, ["10.88.88.88"])
+    challSrv.add_a_record(hostname, ["64.112.117.134"])
 
     # Add an A record for the redirect target that sends it to the real chall
     # test srv for a valid HTTP-01 response.
-    redirHostname = "pebble-challtestsrv.example.com"
-    challSrv.add_a_record(redirHostname, ["10.77.77.77"])
+    redirHostname = "chall-test-srv.example.com"
+    challSrv.add_a_record(redirHostname, ["64.112.117.122"])
 
     # Start a simple python HTTP server on port 80 in its own thread.
-    # NOTE(@cpu): The pebble-challtestsrv binds 10.77.77.77:80 for HTTP-01
-    # challenges so we must use the 10.88.88.88 address for the throw away
+    # NOTE(@cpu): The chall-test-srv binds 64.112.117.122:80 for HTTP-01
+    # challenges so we must use the 64.112.117.134 address for the throw away
     # server for this test and add a mock DNS entry that directs the VA to it.
     redirect = "http://{0}/.well-known/acme-challenge/{1}".format(
             redirHostname, token)
-    httpd = HTTPServer(("10.88.88.88", 80), BouncerHTTPRequestHandler(redirect, guestlist))
+    httpd = HTTPServer(("64.112.117.134", 80), BouncerHTTPRequestHandler(redirect, guestlist))
     thread = threading.Thread(target = httpd.serve_forever)
     thread.daemon = False
     thread.start()
@@ -1005,7 +794,8 @@ def test_http_multiva_threshold_pass():
 
     # Configure a guestlist that will pass the multiVA threshold test by
     # allowing the primary VA at some, but not all, remotes.
-    guestlist = {"boulder": 1, "boulder-remoteva-a": 1, "boulder-remoteva-b": 1, "remoteva-a": 1}
+    # In particular, remoteva-c is missing.
+    guestlist = {"boulder": 1, "remoteva-a": 1, "remoteva-b": 1}
 
     hostname, cleanup = multiva_setup(client, guestlist)
 
@@ -1021,7 +811,7 @@ def test_http_multiva_primary_fail_remote_pass():
 
     # Configure a guestlist that will fail the primary VA check but allow all of
     # the remote VAs.
-    guestlist = {"boulder": 0, "boulder-remoteva-a": 1, "boulder-remoteva-b": 1, "remoteva-a": 1, "remoteva-b": 1}
+    guestlist = {"boulder": 0, "remoteva-a": 1, "remoteva-b": 1}
 
     hostname, cleanup = multiva_setup(client, guestlist)
 
@@ -1124,7 +914,7 @@ def test_http2_http01_challenge():
 
     # Add an A record for the test server to ensure the VA's requests are directed
     # to the interface that we bind the FakeH2ServerHandler to.
-    challSrv.add_a_record(hostname, ["10.88.88.88"])
+    challSrv.add_a_record(hostname, ["64.112.117.134"])
 
     # Allow socket address reuse on the base TCPServer class. Failing to do this
     # causes subsequent integration tests to fail with "Address in use" errors even
@@ -1134,11 +924,11 @@ def test_http2_http01_challenge():
     # the problem.
     socketserver.TCPServer.allow_reuse_address = True
     # Create, start, and wait for a fake HTTP/2 server.
-    server = socketserver.TCPServer(("10.88.88.88", 80), FakeH2ServerHandler)
+    server = socketserver.TCPServer(("64.112.117.134", 80), FakeH2ServerHandler)
     thread = threading.Thread(target = server.serve_forever)
     thread.daemon = False
     thread.start()
-    wait_for_tcp_server("10.88.88.88", 80)
+    wait_for_tcp_server("64.112.117.134", 80)
 
     # Issuing an HTTP-01 challenge for this hostname should produce a connection
     # problem with an error specific to the HTTP/2 misconfiguration.
@@ -1225,11 +1015,6 @@ def test_auth_deactivation_v2():
     resp = client.deactivate_authorization(order.authorizations[0])
     if resp.body.status is not messages.STATUS_DEACTIVATED:
         raise(Exception("unexpected authorization status"))
-
-def test_ocsp():
-    cert_file = temppath('test_ocsp.pem')
-    chisel2.auth_and_issue([random_domain()], cert_output=cert_file.name)
-    verify_ocsp(cert_file.name, "test/certs/webpki/int-rsa-*.cert.pem", "http://localhost:4002", "good")
 
 def test_ct_submission():
     hostname = random_domain()
@@ -1340,128 +1125,6 @@ def test_ocsp_exp_unauth():
     else:
         raise(Exception("timed out waiting for unauthorized OCSP response for expired certificate. Last error: {}".format(last_error)))
 
-def test_blocked_key_account():
-    # Only config-next has a blocked keys file configured.
-    if not CONFIG_NEXT:
-        return
-
-    with open("test/hierarchy/int-r4.key.pem", "rb") as key_file:
-        key = serialization.load_pem_private_key(key_file.read(), password=None, backend=default_backend())
-
-    # Create a client with the JWK set to a blocked private key
-    jwk = josepy.JWKRSA(key=key)
-    client = chisel2.uninitialized_client(jwk)
-    email = "test@not-example.com"
-
-    # Try to create an account
-    testPass = False
-    try:
-        client.new_account(messages.NewRegistration.from_data(email=email,
-                terms_of_service_agreed=True))
-    except acme_errors.Error as e:
-        if e.typ != "urn:ietf:params:acme:error:badPublicKey":
-            raise(Exception("problem did not have correct error type, had {0}".format(e.typ)))
-        if e.detail != "public key is forbidden":
-            raise(Exception("problem did not have correct error detail, had {0}".format(e.detail)))
-        testPass = True
-
-    if testPass is False:
-        raise(Exception("expected account creation to fail with Error when using blocked key"))
-
-def test_blocked_key_cert():
-    # Only config-next has a blocked keys file configured.
-    if not CONFIG_NEXT:
-        return
-
-    with open("test/hierarchy/int-r4.key.pem", "r") as f:
-        pemBytes = f.read()
-
-    domains = [random_domain(), random_domain()]
-    csr = acme_crypto_util.make_csr(pemBytes, domains, False)
-
-    client = chisel2.make_client(None)
-    order = client.new_order(csr)
-    authzs = order.authorizations
-
-    testPass = False
-    cleanup = chisel2.do_http_challenges(client, authzs)
-    try:
-        order = client.poll_and_finalize(order)
-    except acme_errors.Error as e:
-        if e.typ != "urn:ietf:params:acme:error:badCSR":
-            raise(Exception("problem did not have correct error type, had {0}".format(e.typ)))
-        if e.detail != "Error finalizing order :: invalid public key in CSR: public key is forbidden":
-            raise(Exception("problem did not have correct error detail, had {0}".format(e.detail)))
-        testPass = True
-
-    if testPass is False:
-        raise(Exception("expected cert creation to fail with Error when using blocked key"))
-
-def test_expiration_mailer():
-    email_addr = "integration.%x@letsencrypt.org" % random.randrange(2**16)
-    order = chisel2.auth_and_issue([random_domain()], email=email_addr)
-    cert = parse_cert(order)
-    # Check that the expiration mailer sends a reminder
-    expiry = cert.not_valid_after
-    no_reminder = expiry + datetime.timedelta(days=-31)
-    first_reminder = expiry + datetime.timedelta(days=-13)
-    last_reminder = expiry + datetime.timedelta(days=-2)
-
-    requests.post("http://localhost:9381/clear", data='')
-    for time in (no_reminder, first_reminder, last_reminder):
-        print(get_future_output(
-            ["./bin/boulder", "expiration-mailer",
-             "--config", "%s/expiration-mailer.json" % config_dir,
-             "--debug-addr", ":8008"],
-            time))
-    resp = requests.get("http://localhost:9381/count?to=%s" % email_addr)
-    mailcount = int(resp.text)
-    if mailcount != 2:
-        raise(Exception("\nExpiry mailer failed: expected 2 emails, got %d" % mailcount))
-
-caa_recheck_setup_data = {}
-@register_twenty_days_ago
-def caa_recheck_setup():
-    client = chisel2.make_client()
-    # Issue a certificate with the clock set back, and save the authzs to check
-    # later that they are valid (200). They should however require rechecking for
-    # CAA purposes.
-    numNames = 10
-    # Generate numNames subdomains of a random domain
-    base_domain = random_domain()
-    domains = [ "{0}.{1}".format(str(n),base_domain) for n in range(numNames) ]
-    order = chisel2.auth_and_issue(domains, client=client)
-
-    global caa_recheck_setup_data
-    caa_recheck_setup_data = {
-        'client': client,
-        'authzs': order.authorizations,
-    }
-
-def test_recheck_caa():
-    """Request issuance for a domain where we have a old cached authz from when CAA
-       was good. We'll set a new CAA record forbidding issuance; the CAA should
-       recheck CAA and reject the request.
-    """
-    if 'authzs' not in caa_recheck_setup_data:
-        raise(Exception("CAA authzs not prepared for test_caa"))
-    domains = []
-    for a in caa_recheck_setup_data['authzs']:
-        response = caa_recheck_setup_data['client']._post(a.uri, None)
-        if response.status_code != 200:
-            raise(Exception("Unexpected response for CAA authz: ",
-                response.status_code))
-        domain = a.body.identifier.value
-        domains.append(domain)
-
-    # Set a forbidding CAA record on just one domain
-    challSrv.add_caa_issue(domains[3], ";")
-
-    # Request issuance for the previously-issued domain name, which should
-    # now be denied due to CAA.
-    chisel2.expect_problem("urn:ietf:params:acme:error:caa",
-        lambda: chisel2.auth_and_issue(domains, client=caa_recheck_setup_data['client']))
-
 def test_caa_good():
     domain = random_domain()
     challSrv.add_caa_issue(domain, "happy-hacker-ca.invalid")
@@ -1503,38 +1166,6 @@ def test_caa_extensions():
     chisel2.expect_problem("urn:ietf:params:acme:error:caa", lambda: chisel2.auth_and_issue(["accounturi.good-caa-reserved.com"]))
     chisel2.auth_and_issue(["accounturi.good-caa-reserved.com"], client=client)
 
-def test_new_account():
-    """
-    Test creating new accounts with no email, empty email, one email, and a
-    tuple of multiple emails.
-    """
-    for contact in (None, (), ("mailto:single@chisel.com",), ("mailto:one@chisel.com", "mailto:two@chisel.com")):
-        # We don't use `chisel2.make_client` or `messages.NewRegistration.from_data`
-        # here because they do too much client-side processing to make the
-        # contact addresses look "nice".
-        client = chisel2.uninitialized_client()
-        result = client.new_account(messages.NewRegistration(contact=contact, terms_of_service_agreed=True))
-        actual = result.body.contact
-        if contact is not None and contact != actual:
-            raise(Exception("New Account failed: expected contact %s, got %s" % (contact, actual)))
-
-def test_account_update():
-    """
-    Create a new ACME client/account with one contact email. Then update the
-    account to a different contact emails.
-    """
-    for contact in (None, (), ("mailto:single@chisel.com",), ("mailto:one@chisel.com", "mailto:two@chisel.com")):
-        # We don't use `chisel2.update_email` or `messages.NewRegistration.from_data`
-        # here because they do too much client-side processing to make the
-        # contact addresses look "nice".
-        print()
-        client = chisel2.make_client()
-        update = client.net.account.update(body=client.net.account.body.update(contact=contact))
-        result = client.update_registration(update)
-        actual = result.body.contact
-        if contact is not None and contact != actual:
-            raise(Exception("New Account failed: expected contact %s, got %s" % (contact, actual)))
-
 def test_renewal_exemption():
     """
     Under a single domain, issue two certificates for different subdomains of
@@ -1559,15 +1190,6 @@ def test_renewal_exemption():
     chisel2.expect_problem("urn:ietf:params:acme:error:rateLimited",
         lambda: chisel2.auth_and_issue(["mail." + base_domain]))
 
-# TODO(#5545)
-#   - Phase 2: Once the new rate limits are authoritative in config-next, ensure
-#     that this test only runs in config.
-#   - Phase 3: Once the new rate limits are authoritative in config, remove this
-#     test entirely.
-def test_certificates_per_name():
-    chisel2.expect_problem("urn:ietf:params:acme:error:rateLimited",
-        lambda: chisel2.auth_and_issue([random_domain() + ".lim.it"]))
-
 def test_oversized_csr():
     # Number of names is chosen to be one greater than the configured RA/CA maxNames
     numNames = 101
@@ -1581,48 +1203,6 @@ def test_oversized_csr():
 
 def parse_cert(order):
     return x509.load_pem_x509_certificate(order.fullchain_pem.encode(), default_backend())
-
-def test_admin_revoker_cert():
-    cert_file = temppath('test_admin_revoker_cert.pem')
-    order = chisel2.auth_and_issue([random_domain()], cert_output=cert_file.name)
-    parsed_cert = parse_cert(order)
-
-    # Revoke certificate by serial
-    reset_akamai_purges()
-    run(["./bin/admin", 
-        "-config", "%s/admin.json" % config_dir,
-        "-dry-run=false",
-        "revoke-cert",
-        "-serial", '%x' % parsed_cert.serial_number,
-        "-reason", "keyCompromise"])
-
-    # Wait for OCSP response to indicate revocation took place
-    verify_ocsp(cert_file.name, "test/certs/webpki/int-rsa-*.cert.pem", "http://localhost:4002", "revoked", "keyCompromise")
-    verify_akamai_purge()
-
-def test_admin_revoker_batched():
-    serialFile = tempfile.NamedTemporaryFile(
-        dir=tempdir, suffix='.test_admin_revoker_batched.serials.hex',
-        mode='w+', delete=False)
-    cert_files = [
-        temppath('test_admin_revoker_batched.%d.pem' % x) for x in range(3)
-    ]
-
-    for cert_file in cert_files:
-        order = chisel2.auth_and_issue([random_domain()], cert_output=cert_file.name)
-        serialFile.write("%x\n" % parse_cert(order).serial_number)
-    serialFile.close()
-
-    run(["./bin/admin", 
-        "-config", "%s/admin.json" % config_dir,
-        "-dry-run=false",
-        "revoke-cert",
-        "-serials-file", serialFile.name,
-        "-reason", "unspecified",
-        "-parallelism", "2"])
-
-    for cert_file in cert_files:
-        verify_ocsp(cert_file.name, "test/certs/webpki/int-rsa-*.cert.pem", "http://localhost:4002", "revoked", "unspecified")
 
 def test_sct_embedding():
     order = chisel2.auth_and_issue([random_domain()])
@@ -1671,7 +1251,7 @@ def test_auth_deactivation():
 def get_ocsp_response_and_reason(cert_file, issuer_glob, url):
     """Returns the ocsp response output and revocation reason."""
     output = verify_ocsp(cert_file, issuer_glob, url, None)
-    m = re.search('Reason: (\w+)', output)
+    m = re.search(r'Reason: (\w+)', output)
     reason = m.group(1) if m is not None else ""
     return output, reason
 
@@ -1688,10 +1268,9 @@ def ocsp_resigning_setup():
     cert_file = temppath('ocsp_resigning_setup.pem')
     order = chisel2.auth_and_issue([random_domain()], client=client, cert_output=cert_file.name)
 
-    cert = OpenSSL.crypto.load_certificate(
-        OpenSSL.crypto.FILETYPE_PEM, order.fullchain_pem)
+    cert = x509.load_pem_x509_certificate(order.fullchain_pem.encode(), default_backend())
     # Revoke for reason 5: cessationOfOperation
-    client.revoke(josepy.ComparableX509(cert), 5)
+    client.revoke(cert, 5)
 
     ocsp_response, reason = get_ocsp_response_and_reason(
         cert_file.name, "test/certs/webpki/int-rsa-*.cert.pem", "http://localhost:4002")

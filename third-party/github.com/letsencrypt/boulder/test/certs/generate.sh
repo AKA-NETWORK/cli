@@ -17,11 +17,11 @@ ipki() (
   mkdir ipki
   cd ipki
 
-  # Create a generic cert which can be used by our test-only services (like
-  # mail-test-srv) that aren't sophisticated enough to present a different name.
-  # This first invocation also creates the issuer key, so the loops below can
-  # run in the background without racing to create it.
-  minica -domains localhost
+  # Create a generic cert which can be used by our test-only services that
+  # aren't sophisticated enough to present a different name. This first
+  # invocation also creates the issuer key, so the loops below can run in the
+  # background without racing to create it.
+  minica -domains localhost --ip-addresses 127.0.0.1
 
   # Used by challtestsrv to negotiate DoH handshakes. Even though we think of
   # challtestsrv as being external to our infrastructure (because it hosts the
@@ -37,12 +37,12 @@ ipki() (
 
   # Presented by the test redis cluster. Contains IP addresses because Boulder
   # components find individual redis servers via SRV records.
-  minica -domains redis -ip-addresses 10.33.33.2,10.33.33.3,10.33.33.4,10.33.33.5,10.33.33.6,10.33.33.7,10.33.33.8,10.33.33.9
+  minica -domains redis -ip-addresses 10.77.77.2,10.77.77.3,10.77.77.4,10.77.77.5
 
   # Used by Boulder gRPC services as both server and client mTLS certificates.
-  for SERVICE in admin-revoker expiration-mailer ocsp-responder consul \
+  for SERVICE in admin ocsp-responder consul \
     wfe akamai-purger bad-key-revoker crl-updater crl-storer \
-    health-checker rocsp-tool; do
+    health-checker rocsp-tool sfe email-exporter; do
     minica -domains "${SERVICE}.boulder" &
   done
 
@@ -63,6 +63,7 @@ webpki() (
   # This function executes in a subshell, so this cd does not affect the parent
   # script.
   cd ../..
+  make build
   mkdir ./test/certs/webpki
   go run ./test/certs/webpki.go
 )

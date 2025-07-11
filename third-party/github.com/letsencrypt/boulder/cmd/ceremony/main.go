@@ -34,7 +34,7 @@ var kp goodkey.KeyPolicy
 
 func init() {
 	var err error
-	kp, err = goodkey.NewPolicy(&goodkey.Config{FermatRounds: 100}, nil)
+	kp, err = goodkey.NewPolicy(nil, nil)
 	if err != nil {
 		log.Fatal("Could not create goodkey.KeyPolicy")
 	}
@@ -96,7 +96,7 @@ func postIssuanceLinting(fc *x509.Certificate, skipLints []string) error {
 
 type keyGenConfig struct {
 	Type         string `yaml:"type"`
-	RSAModLength uint   `yaml:"rsa-mod-length"`
+	RSAModLength int    `yaml:"rsa-mod-length"`
 	ECDSACurve   string `yaml:"ecdsa-curve"`
 }
 

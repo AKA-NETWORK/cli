@@ -6,28 +6,26 @@ import (
 	"encoding/pem"
 	"flag"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"time"
 
-	"github.com/jmhodges/clock"
-	"github.com/prometheus/client_golang/prometheus"
-
 	"github.com/letsencrypt/boulder/cmd"
 	"github.com/letsencrypt/boulder/config"
+	emailpb "github.com/letsencrypt/boulder/email/proto"
 	"github.com/letsencrypt/boulder/features"
 	"github.com/letsencrypt/boulder/goodkey"
 	"github.com/letsencrypt/boulder/goodkey/sagoodkey"
 	bgrpc "github.com/letsencrypt/boulder/grpc"
 	"github.com/letsencrypt/boulder/grpc/noncebalancer"
 	"github.com/letsencrypt/boulder/issuance"
-	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/nonce"
 	rapb "github.com/letsencrypt/boulder/ra/proto"
 	"github.com/letsencrypt/boulder/ratelimits"
 	bredis "github.com/letsencrypt/boulder/redis"
 	sapb "github.com/letsencrypt/boulder/sa/proto"
+	"github.com/letsencrypt/boulder/unpause"
+	"github.com/letsencrypt/boulder/web"
 	"github.com/letsencrypt/boulder/wfe2"
 )
 
@@ -45,22 +43,26 @@ type Config struct {
 		TLSListenAddress string `validate:"omitempty,hostname_port"`
 
 		// Timeout is the per-request overall timeout. This should be slightly
-		// lower than the upstream's timeout when making request to the WFE.
+		// lower than the upstream's timeout when making requests to this service.
 		Timeout config.Duration `validate:"-"`
+
+		// ShutdownStopTimeout determines the maximum amount of time to wait
+		// for extant request handlers to complete before exiting. It should be
+		// greater than Timeout.
+		ShutdownStopTimeout config.Duration
 
 		ServerCertificatePath string `validate:"required_with=TLSListenAddress"`
 		ServerKeyPath         string `validate:"required_with=TLSListenAddress"`
 
 		AllowOrigins []string
 
-		ShutdownStopTimeout config.Duration
-
 		SubscriberAgreementURL string
 
 		TLS cmd.TLSConfig
 
-		RAService *cmd.GRPCClientConfig
-		SAService *cmd.GRPCClientConfig
+		RAService     *cmd.GRPCClientConfig
+		SAService     *cmd.GRPCClientConfig
+		EmailExporter *cmd.GRPCClientConfig
 
 		// GetNonceService is a gRPC config which contains a single SRV name
 		// used to lookup nonce-service instances used exclusively for nonce
@@ -74,12 +76,13 @@ type Config struct {
 		// local and remote nonce-service instances.
 		RedeemNonceService *cmd.GRPCClientConfig `validate:"required"`
 
-		// NoncePrefixKey is a secret used for deriving the prefix of each nonce
-		// instance. It should contain 256 bits of random data to be suitable as
-		// an HMAC-SHA256 key (e.g. the output of `openssl rand -hex 32`). In a
+		// NonceHMACKey is a path to a file containing an HMAC key which is a
+		// secret used for deriving the prefix of each nonce instance. It should
+		// contain 256 bits (32 bytes) of random data to be suitable as an
+		// HMAC-SHA256 key (e.g. the output of `openssl rand -hex 32`). In a
 		// multi-DC deployment this value should be the same across all
 		// boulder-wfe and nonce-service instances.
-		NoncePrefixKey cmd.PasswordConfig `validate:"-"`
+		NonceHMACKey cmd.HMACKeyConfig `validate:"-"`
 
 		// Chains is a list of lists of certificate filenames. Each inner list is
 		// a chain (starting with the issuing intermediate, followed by one or
@@ -116,17 +119,18 @@ type Config struct {
 		// StaleTimeout determines how old should data be to be accessed via Boulder-specific GET-able APIs
 		StaleTimeout config.Duration `validate:"-"`
 
-		// AuthorizationLifetimeDays defines how long authorizations will be
-		// considered valid for. The WFE uses this to find the creation date of
-		// authorizations by subtracing this value from the expiry. It should match
-		// the value configured in the RA.
-		AuthorizationLifetimeDays int `validate:"required,min=1,max=397"`
+		// AuthorizationLifetimeDays duplicates the RA's config of the same name.
+		// Deprecated: This field no longer has any effect.
+		AuthorizationLifetimeDays int `validate:"-"`
 
-		// PendingAuthorizationLifetimeDays defines how long authorizations may be in
-		// the pending state before expiry. The WFE uses this to find the creation
-		// date of pending authorizations by subtracting this value from the expiry.
-		// It should match the value configured in the RA.
-		PendingAuthorizationLifetimeDays int `validate:"required,min=1,max=29"`
+		// PendingAuthorizationLifetimeDays duplicates the RA's config of the same name.
+		// Deprecated: This field no longer has any effect.
+		PendingAuthorizationLifetimeDays int `validate:"-"`
+
+		// MaxContactsPerRegistration limits the number of contact addresses which
+		// can be provided in a single NewAccount request. Requests containing more
+		// contacts than this are rejected. Default: 10.
+		MaxContactsPerRegistration int `validate:"omitempty,min=1"`
 
 		AccountCache *CacheConfig
 
@@ -152,18 +156,30 @@ type Config struct {
 			Overrides string
 		}
 
-		// MaxNames is the maximum number of subjectAltNames in a single cert.
-		// The value supplied SHOULD be greater than 0 and no more than 100,
-		// defaults to 100. These limits are per section 7.1 of our combined
-		// CP/CPS, under "DV-SSL Subscriber Certificate". The value must match
-		// the CA and RA configurations.
-		MaxNames int `validate:"min=0,max=100"`
+		// CertProfiles is a map of acceptable certificate profile names to
+		// descriptions (perhaps including URLs) of those profiles. NewOrder
+		// Requests with a profile name not present in this map will be rejected.
+		// This field is optional; if unset, no profile names are accepted.
+		CertProfiles map[string]string `validate:"omitempty,dive,keys,alphanum,min=1,max=32,endkeys"`
 
-		// CertificateProfileNames is the list of acceptable certificate profile
-		// names for newOrder requests. Requests with a profile name not in this
-		// list will be rejected. This field is optional; if unset, no profile
-		// names are accepted.
-		CertificateProfileNames []string `validate:"omitempty,dive,alphanum,min=1,max=32"`
+		Unpause struct {
+			// HMACKey signs outgoing JWTs for redemption at the unpause
+			// endpoint. This key must match the one configured for all SFEs.
+			// This field is required to enable the pausing feature.
+			HMACKey cmd.HMACKeyConfig `validate:"required_with=JWTLifetime URL,structonly"`
+
+			// JWTLifetime is the lifetime of the unpause JWTs generated by the
+			// WFE for redemption at the SFE. The minimum value for this field
+			// is 336h (14 days). This field is required to enable the pausing
+			// feature.
+			JWTLifetime config.Duration `validate:"omitempty,required_with=HMACKey URL,min=336h"`
+
+			// URL is the URL of the Self-Service Frontend (SFE). This is used
+			// to build URLs sent to end-users in error messages. This field
+			// must be a URL with a scheme of 'https://' This field is required
+			// to enable the pausing feature.
+			URL string `validate:"omitempty,required_with=HMACKey JWTLifetime,url,startswith=https://,endsnotwith=/"`
+		}
 	}
 
 	Syslog        cmd.SyslogConfig
@@ -199,63 +215,6 @@ func loadChain(certFiles []string) (*issuance.Certificate, []byte, error) {
 	return certs[0], buf.Bytes(), nil
 }
 
-func setupWFE(c Config, scope prometheus.Registerer, clk clock.Clock) (rapb.RegistrationAuthorityClient, sapb.StorageAuthorityReadOnlyClient, nonce.Getter, nonce.Redeemer, string) {
-	tlsConfig, err := c.WFE.TLS.Load(scope)
-	cmd.FailOnError(err, "TLS config")
-
-	raConn, err := bgrpc.ClientSetup(c.WFE.RAService, tlsConfig, scope, clk)
-	cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to RA")
-	rac := rapb.NewRegistrationAuthorityClient(raConn)
-
-	saConn, err := bgrpc.ClientSetup(c.WFE.SAService, tlsConfig, scope, clk)
-	cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to SA")
-	sac := sapb.NewStorageAuthorityReadOnlyClient(saConn)
-
-	if c.WFE.RedeemNonceService == nil {
-		cmd.Fail("'redeemNonceService' must be configured.")
-	}
-	if c.WFE.GetNonceService == nil {
-		cmd.Fail("'getNonceService' must be configured")
-	}
-
-	var rncKey string
-	if c.WFE.NoncePrefixKey.PasswordFile != "" {
-		rncKey, err = c.WFE.NoncePrefixKey.Pass()
-		cmd.FailOnError(err, "Failed to load noncePrefixKey")
-	}
-
-	getNonceConn, err := bgrpc.ClientSetup(c.WFE.GetNonceService, tlsConfig, scope, clk)
-	cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to get nonce service")
-	gnc := nonce.NewGetter(getNonceConn)
-
-	if c.WFE.RedeemNonceService.SRVResolver != noncebalancer.SRVResolverScheme {
-		cmd.Fail(fmt.Sprintf(
-			"'redeemNonceService.SRVResolver' must be set to %q", noncebalancer.SRVResolverScheme),
-		)
-	}
-	redeemNonceConn, err := bgrpc.ClientSetup(c.WFE.RedeemNonceService, tlsConfig, scope, clk)
-	cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to redeem nonce service")
-	rnc := nonce.NewRedeemer(redeemNonceConn)
-
-	return rac, sac, gnc, rnc, rncKey
-}
-
-type errorWriter struct {
-	blog.Logger
-}
-
-func (ew errorWriter) Write(p []byte) (n int, err error) {
-	// log.Logger will append a newline to all messages before calling
-	// Write. Our log checksum checker doesn't like newlines, because
-	// syslog will strip them out so the calculated checksums will
-	// differ. So that we don't hit this corner case for every line
-	// logged from inside net/http.Server we strip the newline before
-	// we get to the checksum generator.
-	p = bytes.TrimRight(p, "\n")
-	ew.Logger.Err(fmt.Sprintf("net/http.Server: %s", string(p)))
-	return
-}
-
 func main() {
 	listenAddr := flag.String("addr", "", "HTTP listen address override")
 	tlsAddr := flag.String("tls-addr", "", "HTTPS listen address override")
@@ -282,11 +241,6 @@ func main() {
 	if *debugAddr != "" {
 		c.WFE.DebugAddr = *debugAddr
 	}
-	maxNames := c.WFE.MaxNames
-	if maxNames == 0 {
-		// Default to 100 names per cert.
-		maxNames = 100
-	}
 
 	certChains := map[issuance.NameID][][]byte{}
 	issuerCerts := map[issuance.NameID]*issuance.Certificate{}
@@ -309,7 +263,52 @@ func main() {
 
 	clk := cmd.Clock()
 
-	rac, sac, gnc, rnc, npKey := setupWFE(c, stats, clk)
+	var unpauseSigner unpause.JWTSigner
+	if features.Get().CheckIdentifiersPaused {
+		unpauseSigner, err = unpause.NewJWTSigner(c.WFE.Unpause.HMACKey)
+		cmd.FailOnError(err, "Failed to create unpause signer from HMACKey")
+	}
+
+	tlsConfig, err := c.WFE.TLS.Load(stats)
+	cmd.FailOnError(err, "TLS config")
+
+	raConn, err := bgrpc.ClientSetup(c.WFE.RAService, tlsConfig, stats, clk)
+	cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to RA")
+	rac := rapb.NewRegistrationAuthorityClient(raConn)
+
+	saConn, err := bgrpc.ClientSetup(c.WFE.SAService, tlsConfig, stats, clk)
+	cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to SA")
+	sac := sapb.NewStorageAuthorityReadOnlyClient(saConn)
+
+	var eec emailpb.ExporterClient
+	if c.WFE.EmailExporter != nil {
+		emailExporterConn, err := bgrpc.ClientSetup(c.WFE.EmailExporter, tlsConfig, stats, clk)
+		cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to email-exporter")
+		eec = emailpb.NewExporterClient(emailExporterConn)
+	}
+
+	if c.WFE.RedeemNonceService == nil {
+		cmd.Fail("'redeemNonceService' must be configured.")
+	}
+	if c.WFE.GetNonceService == nil {
+		cmd.Fail("'getNonceService' must be configured")
+	}
+
+	noncePrefixKey, err := c.WFE.NonceHMACKey.Load()
+	cmd.FailOnError(err, "Failed to load nonceHMACKey file")
+
+	getNonceConn, err := bgrpc.ClientSetup(c.WFE.GetNonceService, tlsConfig, stats, clk)
+	cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to get nonce service")
+	gnc := nonce.NewGetter(getNonceConn)
+
+	if c.WFE.RedeemNonceService.SRVResolver != noncebalancer.SRVResolverScheme {
+		cmd.Fail(fmt.Sprintf(
+			"'redeemNonceService.SRVResolver' must be set to %q", noncebalancer.SRVResolverScheme),
+		)
+	}
+	redeemNonceConn, err := bgrpc.ClientSetup(c.WFE.RedeemNonceService, tlsConfig, stats, clk)
+	cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to redeem nonce service")
+	rnc := nonce.NewRedeemer(redeemNonceConn)
 
 	kp, err := sagoodkey.NewPolicy(&c.WFE.GoodKey, sac.KeyBlocked)
 	cmd.FailOnError(err, "Unable to create key policy")
@@ -318,23 +317,9 @@ func main() {
 		c.WFE.StaleTimeout.Duration = time.Minute * 10
 	}
 
-	// Baseline Requirements v1.8.1 section 4.2.1: "any reused data, document,
-	// or completed validation MUST be obtained no more than 398 days prior
-	// to issuing the Certificate". If unconfigured or the configured value is
-	// greater than 397 days, bail out.
-	if c.WFE.AuthorizationLifetimeDays <= 0 || c.WFE.AuthorizationLifetimeDays > 397 {
-		cmd.Fail("authorizationLifetimeDays value must be greater than 0 and less than 398")
+	if c.WFE.MaxContactsPerRegistration == 0 {
+		c.WFE.MaxContactsPerRegistration = 10
 	}
-	authorizationLifetime := time.Duration(c.WFE.AuthorizationLifetimeDays) * 24 * time.Hour
-
-	// The Baseline Requirements v1.8.1 state that validation tokens "MUST
-	// NOT be used for more than 30 days from its creation". If unconfigured
-	// or the configured value pendingAuthorizationLifetimeDays is greater
-	// than 29 days, bail out.
-	if c.WFE.PendingAuthorizationLifetimeDays <= 0 || c.WFE.PendingAuthorizationLifetimeDays > 29 {
-		cmd.Fail("pendingAuthorizationLifetimeDays value must be greater than 0 and less than 30")
-	}
-	pendingAuthorizationLifetime := time.Duration(c.WFE.PendingAuthorizationLifetimeDays) * 24 * time.Hour
 
 	var limiter *ratelimits.Limiter
 	var txnBuilder *ratelimits.TransactionBuilder
@@ -347,7 +332,7 @@ func main() {
 		source := ratelimits.NewRedisSource(limiterRedis.Ring, clk, stats)
 		limiter, err = ratelimits.NewLimiter(clk, source, stats)
 		cmd.FailOnError(err, "Failed to create rate limiter")
-		txnBuilder, err = ratelimits.NewTransactionBuilder(c.WFE.Limiter.Defaults, c.WFE.Limiter.Overrides)
+		txnBuilder, err = ratelimits.NewTransactionBuilderFromFiles(c.WFE.Limiter.Defaults, c.WFE.Limiter.Overrides)
 		cmd.FailOnError(err, "Failed to create rate limits transaction builder")
 	}
 
@@ -370,18 +355,20 @@ func main() {
 		logger,
 		c.WFE.Timeout.Duration,
 		c.WFE.StaleTimeout.Duration,
-		authorizationLifetime,
-		pendingAuthorizationLifetime,
+		c.WFE.MaxContactsPerRegistration,
 		rac,
 		sac,
+		eec,
 		gnc,
 		rnc,
-		npKey,
+		noncePrefixKey,
 		accountGetter,
 		limiter,
 		txnBuilder,
-		maxNames,
-		c.WFE.CertificateProfileNames,
+		c.WFE.CertProfiles,
+		unpauseSigner,
+		c.WFE.Unpause.JWTLifetime.Duration,
+		c.WFE.Unpause.URL,
 	)
 	cmd.FailOnError(err, "Unable to create WFE")
 
@@ -400,15 +387,7 @@ func main() {
 	logger.Infof("Server running, listening on %s....", c.WFE.ListenAddress)
 	handler := wfe.Handler(stats, c.OpenTelemetryHTTPConfig.Options()...)
 
-	srv := http.Server{
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 120 * time.Second,
-		IdleTimeout:  120 * time.Second,
-		Addr:         c.WFE.ListenAddress,
-		ErrorLog:     log.New(errorWriter{logger}, "", 0),
-		Handler:      handler,
-	}
-
+	srv := web.NewServer(c.WFE.ListenAddress, handler, logger)
 	go func() {
 		err := srv.ListenAndServe()
 		if err != nil && err != http.ErrServerClosed {
@@ -416,14 +395,7 @@ func main() {
 		}
 	}()
 
-	tlsSrv := http.Server{
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 120 * time.Second,
-		IdleTimeout:  120 * time.Second,
-		Addr:         c.WFE.TLSListenAddress,
-		ErrorLog:     log.New(errorWriter{logger}, "", 0),
-		Handler:      handler,
-	}
+	tlsSrv := web.NewServer(c.WFE.TLSListenAddress, handler, logger)
 	if tlsSrv.Addr != "" {
 		go func() {
 			logger.Infof("TLS server listening on %s", tlsSrv.Addr)

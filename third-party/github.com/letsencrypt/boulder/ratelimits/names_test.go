@@ -41,12 +41,24 @@ func TestValidateIdForName(t *testing.T) {
 		{
 			limit: NewRegistrationsPerIPAddress,
 			desc:  "valid IPv4 address",
+			id:    "64.112.117.1",
+		},
+		{
+			limit: NewRegistrationsPerIPAddress,
+			desc:  "reserved IPv4 address",
 			id:    "10.0.0.1",
+			err:   "in a reserved address block",
 		},
 		{
 			limit: NewRegistrationsPerIPAddress,
 			desc:  "valid IPv6 address",
+			id:    "2602:80a:6000::42:42",
+		},
+		{
+			limit: NewRegistrationsPerIPAddress,
+			desc:  "IPv6 address in non-canonical form",
 			id:    "2001:0db8:85a3:0000:0000:8a2e:0370:7334",
+			err:   "must be in canonical form",
 		},
 		{
 			limit: NewRegistrationsPerIPAddress,
@@ -75,7 +87,19 @@ func TestValidateIdForName(t *testing.T) {
 		{
 			limit: NewRegistrationsPerIPv6Range,
 			desc:  "valid IPv6 address range",
-			id:    "2001:0db8:0000::/48",
+			id:    "2602:80a:6000::/48",
+		},
+		{
+			limit: NewRegistrationsPerIPv6Range,
+			desc:  "IPv6 address range in non-canonical form",
+			id:    "2602:080a:6000::/48",
+			err:   "must be in canonical form",
+		},
+		{
+			limit: NewRegistrationsPerIPv6Range,
+			desc:  "IPv6 address range with low bits set",
+			id:    "2602:080a:6000::1/48",
+			err:   "must be in canonical form",
 		},
 		{
 			limit: NewRegistrationsPerIPv6Range,
@@ -94,6 +118,12 @@ func TestValidateIdForName(t *testing.T) {
 			desc:  "IPv4 CIDR when we expect IPv6 CIDR range",
 			id:    "10.0.0.0/16",
 			err:   "must be /48",
+		},
+		{
+			limit: NewRegistrationsPerIPv6Range,
+			desc:  "IPv4 CIDR with invalid long mask",
+			id:    "10.0.0.0/48",
+			err:   "must be an IPv6 CIDR range",
 		},
 		{
 			limit: NewOrdersPerAccount,
@@ -135,6 +165,34 @@ func TestValidateIdForName(t *testing.T) {
 			err:   "invalid regId",
 		},
 		{
+			limit: FailedAuthorizationsForPausingPerDomainPerAccount,
+			desc:  "transaction: valid regId and domain",
+			id:    "12345:example.com",
+		},
+		{
+			limit: FailedAuthorizationsForPausingPerDomainPerAccount,
+			desc:  "transaction: invalid regId",
+			id:    "12ea5:example.com",
+			err:   "invalid regId",
+		},
+		{
+			limit: FailedAuthorizationsForPausingPerDomainPerAccount,
+			desc:  "transaction: invalid domain",
+			id:    "12345:examplecom",
+			err:   "name needs at least one dot",
+		},
+		{
+			limit: FailedAuthorizationsForPausingPerDomainPerAccount,
+			desc:  "override: valid regId",
+			id:    "12345",
+		},
+		{
+			limit: FailedAuthorizationsForPausingPerDomainPerAccount,
+			desc:  "override: invalid regId",
+			id:    "12ea5",
+			err:   "invalid regId",
+		},
+		{
 			limit: CertificatesPerDomainPerAccount,
 			desc:  "transaction: valid regId and domain",
 			id:    "12345:example.com",
@@ -169,6 +227,22 @@ func TestValidateIdForName(t *testing.T) {
 		},
 		{
 			limit: CertificatesPerDomain,
+			desc:  "valid IPv4 address",
+			id:    "64.112.117.1",
+		},
+		{
+			limit: CertificatesPerDomain,
+			desc:  "valid IPv6 address",
+			id:    "2602:80a:6000::",
+		},
+		{
+			limit: CertificatesPerDomain,
+			desc:  "IPv6 address with subnet",
+			id:    "2602:80a:6000::/64",
+			err:   "nor an IP address",
+		},
+		{
+			limit: CertificatesPerDomain,
 			desc:  "malformed domain",
 			id:    "example:.com",
 			err:   "name contains an invalid character",
@@ -177,7 +251,7 @@ func TestValidateIdForName(t *testing.T) {
 			limit: CertificatesPerDomain,
 			desc:  "empty domain",
 			id:    "",
-			err:   "name is empty",
+			err:   "Identifier value (name) is empty",
 		},
 		{
 			limit: CertificatesPerFQDNSet,
@@ -186,13 +260,27 @@ func TestValidateIdForName(t *testing.T) {
 		},
 		{
 			limit: CertificatesPerFQDNSet,
+			desc:  "valid fqdnSet containing a single IPv4 address",
+			id:    "64.112.117.1",
+		},
+		{
+			limit: CertificatesPerFQDNSet,
+			desc:  "valid fqdnSet containing a single IPv6 address",
+			id:    "2602:80a:6000::1",
+		},
+		{
+			limit: CertificatesPerFQDNSet,
 			desc:  "valid fqdnSet containing multiple domains",
 			id:    "example.com,example.org",
+		},
+		{
+			limit: CertificatesPerFQDNSet,
+			desc:  "valid fqdnSet containing multiple domains and IPs",
+			id:    "2602:80a:6000::1,64.112.117.1,example.com,example.org",
 		},
 	}
 
 	for _, tc := range testCases {
-		tc := tc
 		t.Run(fmt.Sprintf("%s/%s", tc.limit, tc.desc), func(t *testing.T) {
 			t.Parallel()
 			err := validateIdForName(tc.limit, tc.id)

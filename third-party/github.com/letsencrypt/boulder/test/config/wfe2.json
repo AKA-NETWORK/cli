@@ -1,5 +1,6 @@
 {
 	"wfe": {
+		"timeout": "30s",
 		"listenAddress": "0.0.0.0:4001",
 		"TLSListenAddress": "0.0.0.0:4431",
 		"serverCertificatePath": "test/certs/ipki/boulder/cert.pem",
@@ -13,9 +14,7 @@
 		"directoryCAAIdentity": "happy-hacker-ca.invalid",
 		"directoryWebsite": "https://github.com/letsencrypt/boulder",
 		"legacyKeyIDPrefix": "http://boulder.service.consul:4000/reg/",
-		"goodkey": {
-			"blockedKeyFile": "test/example-blocked-keys.yaml"
-		},
+		"goodkey": {},
 		"tls": {
 			"caCertFile": "test/certs/ipki/minica.pem",
 			"certFile": "test/certs/ipki/wfe.boulder/cert.pem",
@@ -72,8 +71,8 @@
 			"noWaitForReady": true,
 			"hostOverride": "nonce.boulder"
 		},
-		"noncePrefixKey": {
-			"passwordFile": "test/secrets/nonce_prefix_key"
+		"nonceHMACKey": {
+			"keyFile": "test/secrets/nonce_prefix_key"
 		},
 		"chains": [
 			[
@@ -102,14 +101,49 @@
 			]
 		],
 		"staleTimeout": "5m",
-		"authorizationLifetimeDays": 30,
-		"pendingAuthorizationLifetimeDays": 7,
+		"limiter": {
+			"redis": {
+				"username": "boulder-wfe",
+				"passwordFile": "test/secrets/wfe_ratelimits_redis_password",
+				"lookups": [
+					{
+						"Service": "redisratelimits",
+						"Domain": "service.consul"
+					}
+				],
+				"lookupDNSAuthority": "consul.service.consul",
+				"readTimeout": "250ms",
+				"writeTimeout": "250ms",
+				"poolSize": 100,
+				"routeRandomly": true,
+				"tls": {
+					"caCertFile": "test/certs/ipki/minica.pem",
+					"certFile": "test/certs/ipki/wfe.boulder/cert.pem",
+					"keyFile": "test/certs/ipki/wfe.boulder/key.pem"
+				}
+			},
+			"Defaults": "test/config/wfe2-ratelimit-defaults.yml",
+			"Overrides": "test/config/wfe2-ratelimit-overrides.yml"
+		},
 		"features": {
-			"ServeRenewalInfo": true
+			"ServeRenewalInfo": true,
+			"CheckIdentifiersPaused": true
+		},
+		"certProfiles": {
+			"legacy": "The normal profile you know and love",
+			"modern": "Profile 2: Electric Boogaloo",
+			"shortlived": "Like modern, but smaller"
+		},
+		"unpause": {
+			"hmacKey": {
+				"keyFile": "test/secrets/sfe_unpause_key"
+			},
+			"jwtLifetime": "336h",
+			"url": "https://boulder.service.consul:4003"
 		}
 	},
 	"syslog": {
-		"stdoutlevel": 4,
+		"stdoutlevel": 7,
 		"sysloglevel": 6
 	}
 }

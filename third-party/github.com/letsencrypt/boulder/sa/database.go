@@ -266,24 +266,23 @@ func (log *SQLLogger) Printf(format string, v ...interface{}) {
 func initTables(dbMap *borp.DbMap) {
 	regTable := dbMap.AddTableWithName(regModel{}, "registrations").SetKeys(true, "ID")
 
-	regTable.SetVersionCol("LockCol")
 	regTable.ColMap("Key").SetNotNull(true)
 	regTable.ColMap("KeySHA256").SetNotNull(true).SetUnique(true)
 	dbMap.AddTableWithName(issuedNameModel{}, "issuedNames").SetKeys(true, "ID")
 	dbMap.AddTableWithName(core.Certificate{}, "certificates").SetKeys(true, "ID")
-	dbMap.AddTableWithName(core.CertificateStatus{}, "certificateStatus").SetKeys(true, "ID")
+	dbMap.AddTableWithName(certificateStatusModel{}, "certificateStatus").SetKeys(true, "ID")
 	dbMap.AddTableWithName(core.FQDNSet{}, "fqdnSets").SetKeys(true, "ID")
-	if features.Get().MultipleCertificateProfiles {
-		dbMap.AddTableWithName(orderModelv2{}, "orders").SetKeys(true, "ID")
-	} else {
-		dbMap.AddTableWithName(orderModelv1{}, "orders").SetKeys(true, "ID")
+	tableMap := dbMap.AddTableWithName(orderModel{}, "orders").SetKeys(true, "ID")
+	if !features.Get().StoreARIReplacesInOrders {
+		tableMap.ColMap("Replaces").SetTransient(true)
 	}
+
 	dbMap.AddTableWithName(orderToAuthzModel{}, "orderToAuthz").SetKeys(false, "OrderID", "AuthzID")
 	dbMap.AddTableWithName(orderFQDNSet{}, "orderFqdnSets").SetKeys(true, "ID")
 	dbMap.AddTableWithName(authzModel{}, "authz2").SetKeys(true, "ID")
 	dbMap.AddTableWithName(orderToAuthzModel{}, "orderToAuthz2").SetKeys(false, "OrderID", "AuthzID")
 	dbMap.AddTableWithName(recordedSerialModel{}, "serials").SetKeys(true, "ID")
-	dbMap.AddTableWithName(precertificateModel{}, "precertificates").SetKeys(true, "ID")
+	dbMap.AddTableWithName(lintingCertModel{}, "precertificates").SetKeys(true, "ID")
 	dbMap.AddTableWithName(keyHashModel{}, "keyHashToSerial").SetKeys(true, "ID")
 	dbMap.AddTableWithName(incidentModel{}, "incidents").SetKeys(true, "ID")
 	dbMap.AddTable(incidentSerialModel{})
@@ -291,6 +290,7 @@ func initTables(dbMap *borp.DbMap) {
 	dbMap.AddTableWithName(revokedCertModel{}, "revokedCertificates").SetKeys(true, "ID")
 	dbMap.AddTableWithName(replacementOrderModel{}, "replacementOrders").SetKeys(true, "ID")
 	dbMap.AddTableWithName(pausedModel{}, "paused")
+	dbMap.AddTableWithName(overrideModel{}, "overrides").SetKeys(false, "limitEnum", "bucketKey")
 
 	// Read-only maps used for selecting subsets of columns.
 	dbMap.AddTableWithName(CertStatusMetadata{}, "certificateStatus")
