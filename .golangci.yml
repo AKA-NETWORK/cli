@@ -8,6 +8,9 @@ linters:
    # set, and we should have separate work to enable them if we truly want them.
    - staticcheck
    - errcheck
+  exclusions:
+    paths:
+      - third-party
 
 formatters:
   enable:

@@ -388,17 +388,13 @@ func createRun(opts *CreateOptions) error {
 		return err
 	}
 
-	if opts.TitleProvided {
-		state.Title = opts.Title
-	}
-
-	if opts.BodyProvided {
-		state.Body = opts.Body
-	}
-
 	var openURL string
 
 	if opts.WebMode {
+		if !(opts.Autofill || opts.FillFirst) {
+			state.Title = opts.Title
+			state.Body = opts.Body
+		}
 		if opts.Template != "" {
 			state.Template = opts.Template
 		}
@@ -415,6 +411,14 @@ func createRun(opts *CreateOptions) error {
 			return err
 		}
 		return previewPR(*opts, openURL)
+	}
+
+	if opts.TitleProvided {
+		state.Title = opts.Title
+	}
+
+	if opts.BodyProvided {
+		state.Body = opts.Body
 	}
 
 	existingPR, _, err := opts.Finder.Find(shared.FindOptions{
